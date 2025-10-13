@@ -9,12 +9,13 @@ Notes:
 4. The application is run from main.go file 
 5. the terminal interaction implementation and CSV parser was mostly created using LLM generated code.
 6. SQLite3 used for persistent storage.
-7. My interactive Grader Marks successful test cases as failure too, cuz the db doesnt match wit hthe inactive nodes too.
+7. My interactive Grader Marks successful test cases as failure too, cuz the db doesnt match with the inactive nodes.
 
 What might be breaking currently:
 
 
 Run cmd: `go build -o main main.go`
+`./main`
 to execute the application.
 
 === System Ready ===
