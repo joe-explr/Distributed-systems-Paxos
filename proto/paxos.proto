@@ -1,0 +1,161 @@
+syntax = "proto3";
+
+package paxos;
+
+option go_package = "./proto";
+
+// Ballot number is a tuple (round, node_id)
+message BallotNumber {
+    int32 round = 1;
+    int32 node_id = 2;
+}
+
+// Transaction message containing transfer details
+message Transaction {
+    string sender = 1;
+    string receiver = 2;
+    int32 amount = 3;
+}
+
+// Client request message
+message Request {
+    string client_id = 1;
+    int64 timestamp = 2;
+    Transaction transaction = 3;
+}
+
+// Paxos protocol messages
+message Prepare {
+    BallotNumber ballot = 1;
+}
+
+message Promise {
+    BallotNumber ballot = 1;
+    repeated AcceptLogEntry accept_log = 2;
+    int32 sender_id = 3;
+    int32 executed_seq = 4;
+}
+
+message PrepareAck {
+    BallotNumber ballot = 1;
+    bool queued = 2; // true if prepare was queued for later processing
+    string message = 3; // status message
+}
+
+message AcceptLogEntry {
+    BallotNumber accept_num = 1;
+    int32 accept_seq = 2;
+    Request accept_val = 3;
+}
+
+message Accept {
+    BallotNumber ballot = 1;
+    int32 sequence = 2;
+    Request request = 3;
+}
+
+message AcceptAck {
+    bool success = 1;
+    string message = 2;
+    int32 node_id = 3;
+}
+
+message Accepted {
+    BallotNumber ballot = 1;
+    int32 sequence = 2;
+    Request request = 3;
+    int32 node_id = 4;
+}
+
+message Commit {
+    BallotNumber ballot = 1;
+    int32 sequence = 2;
+    Request request = 3;
+}
+
+message NewView {
+    BallotNumber ballot = 1;
+    repeated AcceptLogEntry accept_log = 2;
+}
+
+message Reply {
+    BallotNumber ballot = 1;
+    int64 timestamp = 2;
+    string client_id = 3;
+    bool result = 4;
+    string message = 5;
+}
+
+// Node information
+message NodeInfo {
+    int32 node_id = 1;
+    string address = 2;
+    int32 port = 3;
+}
+
+// Client information
+message ClientInfo {
+    string client_id = 1;
+    string address = 2;
+    int32 port = 3;
+}
+
+// System configuration
+message SystemConfig {
+    repeated NodeInfo nodes = 1;
+    repeated ClientInfo clients = 2;
+    int32 f = 3; // maximum number of faulty nodes
+}
+
+// Status messages
+message Status {
+    string status = 1;
+    string message = 2;
+}
+
+// Empty message for simple RPC calls
+message Empty {}
+
+// PrintStatus request message
+message PrintStatusRequest {
+    int32 sequence_number = 1;
+}
+
+// Client-facing service - only what clients need
+service PaxosService {
+    // Client to Node communication
+    rpc SendRequest(Request) returns (Reply);
+    
+    // Utility functions (if clients need them)
+    rpc GetStatus(Empty) returns (Status);
+    rpc PrintLog(Empty) returns (Status);
+    rpc PrintDB(Empty) returns (Status);
+    rpc PrintStatus(PrintStatusRequest) returns (Status);
+    rpc PrintView(Empty) returns (Status);
+}
+
+// Internal node-to-node service - Paxos protocol only
+service NodeService {
+    // Paxos protocol messages
+    rpc HandlePrepare(Prepare) returns (PrepareAck);
+    rpc HandlePromise(Promise) returns (Status);
+    rpc HandleAccept(Accept) returns (AcceptAck);
+    rpc HandleAccepted(Accepted) returns (Status);
+    rpc HandleCommit(Commit) returns (Status);
+    rpc HandleNewView(NewView) returns (Status);
+    
+    // Request forwarding (when non-leader receives client request)
+    rpc HandleRequest(Request) returns (Status);
+    
+    // active catch-up
+    rpc RequestNewView(Empty) returns (NewView);
+    
+    // leader discovery
+    rpc GetLeader(Empty) returns (NodeInfo);
+}
+
+// Client service - for nodes to send replies to clients
+service ClientService {
+    // Node to Client communication
+    rpc SendReply(Reply) returns (Status);
+}
