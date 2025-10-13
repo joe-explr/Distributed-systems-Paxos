@@ -1,5 +1,3 @@
-# Paxos Banking System - Day 1 Implementation
-
 Name: Joseph B Antony
 SBU ID: 116006668
 
