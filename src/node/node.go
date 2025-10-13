@@ -152,19 +152,48 @@ func (n *Node) handleLeaderTimeout() {
 	n.mu.Lock()
 	now := time.Now()
 	var highestPrepare *proto.Prepare
+	var recentPrepare *proto.Prepare
+
+	// First, look for prepare messages within the tp window (preferred)
 	for _, prepareWithTime := range n.ReceivedPrepares {
 		if now.Sub(prepareWithTime.Timestamp) <= n.PrepareCooldown.tp {
+			if recentPrepare == nil || IsHigherBallot(prepareWithTime.Prepare.Ballot, recentPrepare.Ballot) {
+				recentPrepare = prepareWithTime.Prepare
+			}
+		}
+	}
+
+	// If no recent prepare messages, look for ANY prepare message (fallback)
+	if recentPrepare == nil {
+		for _, prepareWithTime := range n.ReceivedPrepares {
 			if highestPrepare == nil || IsHigherBallot(prepareWithTime.Prepare.Ballot, highestPrepare.Ballot) {
 				highestPrepare = prepareWithTime.Prepare
 			}
 		}
 	}
+
+	// Clean up old prepare messages to prevent memory leaks
+	var validPrepares []*PrepareWithTimestamp
+	for _, prepareWithTime := range n.ReceivedPrepares {
+		// Keep prepare messages that are either recent or the highest ballot
+		if now.Sub(prepareWithTime.Timestamp) <= n.PrepareCooldown.tp ||
+			(highestPrepare != nil && prepareWithTime.Prepare.Ballot.Round == highestPrepare.Ballot.Round &&
+				prepareWithTime.Prepare.Ballot.NodeId == highestPrepare.Ballot.NodeId) {
+			validPrepares = append(validPrepares, prepareWithTime)
+		}
+	}
+	n.ReceivedPrepares = validPrepares
 	n.mu.Unlock()
 
-	if highestPrepare != nil {
+	// Process recent prepare message if available, otherwise process any prepare message
+	if recentPrepare != nil {
 		n.Logger.Log("TIMEOUT", fmt.Sprintf("Found prepare message %d.%d in last tp time, sending ACK",
+			recentPrepare.Ballot.Round, recentPrepare.Ballot.NodeId), n.ID)
+		n.processPrepareMessageDirectly(recentPrepare)
+		return
+	} else if highestPrepare != nil {
+		n.Logger.Log("TIMEOUT", fmt.Sprintf("Found older prepare message %d.%d (outside tp window), processing anyway to prevent election deadlock",
 			highestPrepare.Ballot.Round, highestPrepare.Ballot.NodeId), n.ID)
-
 		n.processPrepareMessageDirectly(highestPrepare)
 		return
 	}
