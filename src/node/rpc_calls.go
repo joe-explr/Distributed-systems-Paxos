@@ -2,6 +2,8 @@ package node
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"paxos-banking/proto"
 	"paxos-banking/src/common"
@@ -12,17 +14,11 @@ import (
 	"google.golang.org/grpc/metadata"
 )
 
-func (n *Node) SendRequest(ctx context.Context, req *proto.Request) (*proto.Reply, error) {
+func (n *Node) SendRequest(ctx context.Context, req *proto.Request) (*proto.Status, error) {
 
 	if !n.IsNodeActive() {
 		n.Logger.Log("RPC", fmt.Sprintf("Rejecting SendRequest from client %s - node is inactive", req.ClientId), n.ID)
-		return &proto.Reply{
-			Ballot:    n.ProposedBallotNumber,
-			Timestamp: req.Timestamp,
-			ClientId:  req.ClientId,
-			Result:    false,
-			Message:   "Node is down",
-		}, nil
+		return &proto.Status{Status: "INACTIVE", Message: "Node inactive"}, nil
 	}
 
 	n.mu.Lock()
@@ -30,69 +26,160 @@ func (n *Node) SendRequest(ctx context.Context, req *proto.Request) (*proto.Repl
 	lastTimestamp, exists := n.LastClientTimestamp[clientKey]
 
 	if exists && req.Timestamp <= lastTimestamp {
-
 		n.Logger.Log("DUPLICATE", fmt.Sprintf("Duplicate request from client %s (timestamp %d <= %d)",
 			req.ClientId, req.Timestamp, lastTimestamp), n.ID)
 
 		if cachedReply, hasReply := n.LastClientReply[clientKey]; hasReply {
-			n.mu.Unlock()
-			return cachedReply, nil
+
+			if cachedReply.Timestamp == req.Timestamp {
+
+				n.mu.Unlock()
+
+				go func(rep *proto.Reply, clientID string) {
+					conn, err := n.getClientConnection(clientID)
+					if err != nil {
+						n.Logger.Log("ERROR", fmt.Sprintf("Failed to reconnect to client %s for duplicate reply: %v", clientID, err), n.ID)
+						return
+					}
+					client := proto.NewClientServiceClient(conn)
+					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer cancel()
+					if _, err := client.SendReply(ctx, rep); err != nil {
+						n.Logger.Log("ERROR", fmt.Sprintf("Failed to re-send cached reply to client %s: %v", clientID, err), n.ID)
+						return
+					}
+					n.Logger.Log("REPLY", fmt.Sprintf("Re-sent cached reply to client %s for timestamp %d", clientID, rep.Timestamp), n.ID)
+				}(cachedReply, req.ClientId)
+
+				return &proto.Status{Status: "OK_ACCEPTED", Message: "Duplicate; reply re-sent"}, nil
+			} else {
+
+				n.Logger.Log("DUPLICATE", fmt.Sprintf("Cached reply timestamp %d doesn't match request timestamp %d for client %s - last request may have failed or is still processing it",
+					cachedReply.Timestamp, req.Timestamp, req.ClientId), n.ID)
+
+			}
 		}
 	}
 
-	n.LastClientTimestamp[clientKey] = req.Timestamp
 	n.mu.Unlock()
 
 	n.Logger.Log("RPC", fmt.Sprintf("Received SendRequest from client %s", req.ClientId), n.ID)
 
-	n.requestChan <- req
-
-	var replyBallot *proto.BallotNumber
 	n.mu.RLock()
 	isLeader := n.IsLeader
-	proposed := n.ProposedBallotNumber
-	leaderID := n.LeaderID
-	highest := n.HighestBallotSeen
+	knownLeader := n.LeaderID
 	n.mu.RUnlock()
-	if isLeader && proposed != nil {
-		replyBallot = proposed
-	} else if leaderID > 0 && highest != nil {
-		replyBallot = &proto.BallotNumber{Round: highest.Round, NodeId: leaderID}
-	} else {
-		replyBallot = nil
+
+	if !isLeader {
+
+		if knownLeader == 0 {
+
+			n.Logger.Log("ENQUEUE", fmt.Sprintf("Attempting to enqueue request from client %s to requestChan", req.ClientId), n.ID)
+
+			select {
+			case n.requestChan <- req:
+				n.Logger.Log("ENQUEUE", fmt.Sprintf("Successfully enqueued request from client %s", req.ClientId), n.ID)
+
+				status := &proto.Status{Status: "PENDING", Message: "Election in progress", LeaderId: 0}
+				return status, nil
+			default:
+
+				n.Logger.Log("ERROR", fmt.Sprintf("Request queue full, rejecting client %s", req.ClientId), n.ID)
+				status := &proto.Status{Status: "ERROR", Message: "Request queue full", LeaderId: 0}
+				return status, nil
+			}
+		}
+
+		if knownLeader != 0 {
+
+			conn, err := n.getConnection(knownLeader)
+			if err != nil {
+				n.Logger.Log("ERROR", fmt.Sprintf("Failed to connect to leader %d: %v", knownLeader, err), n.ID)
+
+				go func() {
+					n.mu.Lock()
+					n.LeaderID = 0
+					n.mu.Unlock()
+					n.Logger.Log("LEADER", fmt.Sprintf("Cleared LeaderID due to connection failure to node %d", knownLeader), n.ID)
+				}()
+
+				n.Logger.Log("ENQUEUE", fmt.Sprintf("Attempting to enqueue request from client %s to requestChan", req.ClientId), n.ID)
+				select {
+				case n.requestChan <- req:
+					n.Logger.Log("ENQUEUE", fmt.Sprintf("Successfully enqueued request from client %s", req.ClientId), n.ID)
+					status := &proto.Status{Status: "PENDING", Message: "Election in progress", LeaderId: 0}
+					return status, nil
+				default:
+					n.Logger.Log("ERROR", fmt.Sprintf("Request queue full, rejecting client %s", req.ClientId), n.ID)
+					status := &proto.Status{Status: "ERROR", Message: "Request queue full", LeaderId: 0}
+					return status, nil
+				}
+			}
+
+			client := proto.NewNodeServiceClient(conn)
+			_, err = client.HandleRequest(context.Background(), req)
+			if err != nil {
+				n.Logger.Log("ERROR", fmt.Sprintf("Failed to forward request to leader %d: %v", knownLeader, err), n.ID)
+
+				go func() {
+					n.mu.Lock()
+					n.LeaderID = 0
+					n.mu.Unlock()
+					n.Logger.Log("LEADER", fmt.Sprintf("Cleared LeaderID due to leader failure: %v", err), n.ID)
+				}()
+
+				n.Logger.Log("ENQUEUE", fmt.Sprintf("Attempting to enqueue request from client %s to requestChan", req.ClientId), n.ID)
+				select {
+				case n.requestChan <- req:
+					n.Logger.Log("ENQUEUE", fmt.Sprintf("Successfully enqueued request from client %s", req.ClientId), n.ID)
+					status := &proto.Status{Status: "PENDING", Message: "Election in progress", LeaderId: 0}
+					return status, nil
+				default:
+					n.Logger.Log("ERROR", fmt.Sprintf("Request queue full, rejecting client %s", req.ClientId), n.ID)
+					status := &proto.Status{Status: "ERROR", Message: "Request queue full", LeaderId: 0}
+					return status, nil
+				}
+			}
+
+			status := &proto.Status{Status: "OK_ACCEPTED", Message: "Forwarded to leader", LeaderId: knownLeader}
+			return status, nil
+		}
+
+		status := &proto.Status{Status: "NOT_LEADER", Message: "Not leader", LeaderId: 0}
+		return status, nil
 	}
 
-	reply := &proto.Reply{
-		Ballot:    replyBallot,
-		Timestamp: req.Timestamp,
-		ClientId:  req.ClientId,
-		Result:    true,
-		Message:   "Request queued for processing",
-	}
-
-	return reply, nil
+	n.requestChan <- req
+	status := &proto.Status{Status: "OK_ACCEPTED", Message: "Accepted for processing", LeaderId: n.ID}
+	return status, nil
 }
 
 func (n *Node) HandleRequest(ctx context.Context, req *proto.Request) (*proto.Status, error) {
 
 	if !n.IsNodeActive() {
 		n.Logger.Log("RPC", fmt.Sprintf("Rejecting HandleRequest from another node for client %s - node is inactive", req.ClientId), n.ID)
-		return &proto.Status{
-			Status:  "error",
-			Message: "Node is down",
-		}, nil
+		return nil, fmt.Errorf("node is inactive")
 	}
 
 	n.Logger.Log("RPC", fmt.Sprintf("Received HandleRequest from another node for client %s", req.ClientId), n.ID)
 
-	n.requestChan <- req
-
-	status := &proto.Status{
-		Status:  "success",
-		Message: "Request forwarded",
+	select {
+	case n.requestChan <- req:
+		return &proto.Status{
+			Status:   "OK_ACCEPTED",
+			Message:  "Forwarded to leader",
+			LeaderId: n.ID,
+		}, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+		n.Logger.Log("ERROR", fmt.Sprintf("Request queue full, rejecting client %s", req.ClientId), n.ID)
+		return &proto.Status{
+			Status:   "ERROR",
+			Message:  "Request queue full",
+			LeaderId: n.ID,
+		}, nil
 	}
-
-	return status, nil
 }
 
 func (n *Node) HandlePrepare(ctx context.Context, req *proto.Prepare) (*proto.PrepareAck, error) {
@@ -218,6 +305,15 @@ func (n *Node) HandlePromise(ctx context.Context, req *proto.Promise) (*proto.St
 
 func (n *Node) HandleAccept(ctx context.Context, req *proto.Accept) (*proto.AcceptAck, error) {
 
+	if req == nil || req.Ballot == nil {
+		n.Logger.Log("ERROR", "Received HandleAccept with nil request or ballot - ignoring", n.ID)
+		return &proto.AcceptAck{
+			Success: false,
+			Message: "Invalid Accept message",
+			NodeId:  n.ID,
+		}, nil
+	}
+
 	if !n.IsNodeActive() {
 		n.Logger.Log("RPC", fmt.Sprintf("Rejecting HandleAccept for sequence %d with ballot %d.%d - node is inactive",
 			req.Sequence, req.Ballot.Round, req.Ballot.NodeId), n.ID)
@@ -269,7 +365,15 @@ func (n *Node) processAcceptAsync(req *proto.Accept) {
 		n.HighestBallotSeen = req.Ballot
 	}
 
-	n.updateTransactionStatusLocked(req.Sequence, req.Request, common.Accepted, req.Ballot)
+	if ti, exists := n.TransactionStatus[req.Sequence]; exists {
+		if ti.Status == common.Executed || ti.Status == common.Committed {
+			ti.BallotNumber = req.Ballot
+		} else {
+			n.updateTransactionStatusLocked(req.Sequence, req.Request, common.Accepted, req.Ballot)
+		}
+	} else {
+		n.updateTransactionStatusLocked(req.Sequence, req.Request, common.Accepted, req.Ballot)
+	}
 
 	n.AcceptedTransactions[req.Sequence] = req.Request
 
@@ -360,6 +464,12 @@ func (n *Node) processCommitAsync(req *proto.Commit) {
 
 	recovering := n.RecoveryState == RecoveryInProgress
 	leaderID := req.Ballot.NodeId
+
+	if req.Sequence <= n.ExecutedSeq {
+		n.Logger.Log("IGNORE", fmt.Sprintf("Ignoring commit for already executed seq %d (executed=%d)", req.Sequence, n.ExecutedSeq), n.ID)
+		n.mu.Unlock()
+		return
+	}
 	defer n.mu.Unlock()
 
 	if transactionInfo, exists := n.TransactionStatus[req.Sequence]; exists {
@@ -397,6 +507,14 @@ func (n *Node) processCommitAsync(req *proto.Commit) {
 
 func (n *Node) HandleNewView(ctx context.Context, req *proto.NewView) (*proto.Status, error) {
 
+	if req == nil || req.Ballot == nil {
+		n.Logger.Log("ERROR", "Received HandleNewView with nil request or ballot - ignoring", n.ID)
+		return &proto.Status{
+			Status:  "error",
+			Message: "Invalid NewView message",
+		}, nil
+	}
+
 	if !n.IsNodeActive() {
 		n.Logger.Log("RPC", fmt.Sprintf("Rejecting HandleNewView from ballot %d.%d - node is inactive", req.Ballot.Round, req.Ballot.NodeId), n.ID)
 		return &proto.Status{
@@ -420,6 +538,73 @@ func (n *Node) HandleNewView(ctx context.Context, req *proto.NewView) (*proto.St
 	return status, nil
 }
 
+func (n *Node) SendCheckpoint(ctx context.Context, req *proto.Checkpoint) (*proto.Status, error) {
+
+	if !n.IsNodeActive() {
+		n.Logger.Log("RPC", fmt.Sprintf("Rejecting SendCheckpoint seq=%d - node is inactive", req.Seq), n.ID)
+		return &proto.Status{Status: "error", Message: "Node is down"}, nil
+	}
+
+	n.Logger.Log("RPC", fmt.Sprintf("Received SendCheckpoint seq=%d", req.Seq), n.ID)
+
+	if len(req.State) > 0 {
+		n.mu.Lock()
+		err := n.installCheckpointStateLocked(req.Seq, req.State, req.Digest)
+		n.mu.Unlock()
+		if err != nil {
+			n.Logger.Log("ERROR", fmt.Sprintf("Failed to install checkpoint %d: %v", req.Seq, err), n.ID)
+			return &proto.Status{Status: "error", Message: err.Error()}, nil
+		}
+		return &proto.Status{Status: "success", Message: "Checkpoint installed"}, nil
+	}
+
+	n.mu.Lock()
+	n.LastCheckpointSeq = req.Seq
+	n.LastCheckpointDigest = req.Digest
+	n.mu.Unlock()
+	return &proto.Status{Status: "success", Message: "Checkpoint metadata recorded"}, nil
+}
+
+func (n *Node) RequestCheckpoint(ctx context.Context, req *proto.CheckpointRequest) (*proto.CheckpointSnapshot, error) {
+
+	if !n.IsNodeActive() {
+		n.Logger.Log("RPC", fmt.Sprintf("Rejecting RequestCheckpoint seq=%d - node is inactive", req.Seq), n.ID)
+		return nil, fmt.Errorf("node is inactive")
+	}
+
+	n.mu.RLock()
+	seq := n.LastCheckpointSeq
+	state := n.LastCheckpointState
+	digest := n.LastCheckpointDigest
+	n.mu.RUnlock()
+
+	if seq != req.Seq || len(state) == 0 || len(digest) == 0 {
+
+		n.mu.Lock()
+		if n.ExecutedSeq >= req.Seq {
+			bytes, dig, err := n.serializeSnapshotLocked()
+			if err == nil {
+
+				state = bytes
+				digest = dig
+				seq = n.ExecutedSeq
+			}
+		}
+		n.mu.Unlock()
+	}
+
+	if len(state) == 0 || len(digest) == 0 {
+		return nil, fmt.Errorf("no snapshot available")
+	}
+
+	sum := sha256.Sum256(state)
+	if hex.EncodeToString(sum[:]) != hex.EncodeToString(digest) {
+		return nil, fmt.Errorf("local snapshot digest mismatch")
+	}
+
+	return &proto.CheckpointSnapshot{Seq: seq, State: state, Digest: digest}, nil
+}
+
 func (n *Node) processNewViewAsync(req *proto.NewView) {
 
 	if req == nil {
@@ -435,6 +620,12 @@ func (n *Node) processNewViewAsync(req *proto.NewView) {
 	n.mu.Lock()
 
 	n.NewViewLog = append(n.NewViewLog, req)
+
+	key := fmt.Sprintf("%d.%d", req.Ballot.Round, req.Ballot.NodeId)
+	if n.NewViewReceived == nil {
+		n.NewViewReceived = make(map[string]bool)
+	}
+	n.NewViewReceived[key] = true
 	n.Logger.Log("NEWVIEW", fmt.Sprintf("Received NEW-VIEW from leader %d, ballot %d.%d",
 		req.Ballot.NodeId, req.Ballot.Round, req.Ballot.NodeId), n.ID)
 
@@ -442,8 +633,30 @@ func (n *Node) processNewViewAsync(req *proto.NewView) {
 		n.HighestBallotSeen = req.Ballot
 	}
 
+	if n.IsLeader && req.Ballot.NodeId != n.ID {
+		if n.ProposedBallotNumber == nil || IsHigherBallot(req.Ballot, n.ProposedBallotNumber) {
+			n.Logger.Log("STEPDOWN",
+				fmt.Sprintf("Stepping down as leader - received NEW-VIEW from node %d with ballot %d.%d",
+					req.Ballot.NodeId, req.Ballot.Round, req.Ballot.NodeId), n.ID)
+			n.IsLeader = false
+			n.NodeType = common.Backup
+			n.PromiseCount = 0
+
+			for k := range n.PromiseAcceptLog {
+				delete(n.PromiseAcceptLog, k)
+			}
+		}
+	}
+
 	n.LeaderID = req.Ballot.NodeId
 	n.LastLeaderMessage = time.Now()
+
+	if req.BaseCheckpointSeq > n.LastCheckpointSeq {
+
+		if len(n.LastCheckpointState) == 0 || n.LastCheckpointSeq != req.BaseCheckpointSeq {
+			go n.ensureCheckpointInstalled(req.BaseCheckpointSeq, req.BaseCheckpointDigest, req.Ballot.NodeId)
+		}
+	}
 
 	acceptedMsgs := make([]*proto.Accepted, 0, len(req.AcceptLog))
 	for _, acceptLogEntry := range req.AcceptLog {
@@ -497,13 +710,13 @@ func (n *Node) processNewViewAsync(req *proto.NewView) {
 			}
 		}(leaderID)
 	}
+	if len(acceptedMsgs) > 0 {
+		if shouldStartTimer {
+			go n.startTimerOnAccept()
+		}
 
-	if shouldStartTimer {
-		go n.startTimerOnAccept()
+		go n.restartTimerIfNeeded()
 	}
-
-	go n.restartTimerIfNeeded()
-
 }
 
 func (n *Node) processNewViewAcceptMessage(accept *proto.Accept, alreadyExecuted bool) {
@@ -604,8 +817,10 @@ func (n *Node) RequestNewView(ctx context.Context, req *proto.Empty) (*proto.New
 
 	rangedLog := n.createAcceptLogFromLeaderState(fromSeq)
 	newView := &proto.NewView{
-		Ballot:    n.ProposedBallotNumber,
-		AcceptLog: rangedLog,
+		Ballot:               n.ProposedBallotNumber,
+		AcceptLog:            rangedLog,
+		BaseCheckpointSeq:    n.LastCheckpointSeq,
+		BaseCheckpointDigest: n.LastCheckpointDigest,
 	}
 
 	n.Logger.Log("RECOVERY", fmt.Sprintf("Created NEW-VIEW for recovery with %d entries", len(newView.AcceptLog)), n.ID)

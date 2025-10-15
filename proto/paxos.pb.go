@@ -242,13 +242,16 @@ func (x *Prepare) GetBallot() *BallotNumber {
 }
 
 type Promise struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Ballot        *BallotNumber          `protobuf:"bytes,1,opt,name=ballot,proto3" json:"ballot,omitempty"`
-	AcceptLog     []*AcceptLogEntry      `protobuf:"bytes,2,rep,name=accept_log,json=acceptLog,proto3" json:"accept_log,omitempty"`
-	SenderId      int32                  `protobuf:"varint,3,opt,name=sender_id,json=senderId,proto3" json:"sender_id,omitempty"`
-	ExecutedSeq   int32                  `protobuf:"varint,4,opt,name=executed_seq,json=executedSeq,proto3" json:"executed_seq,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	Ballot      *BallotNumber          `protobuf:"bytes,1,opt,name=ballot,proto3" json:"ballot,omitempty"`
+	AcceptLog   []*AcceptLogEntry      `protobuf:"bytes,2,rep,name=accept_log,json=acceptLog,proto3" json:"accept_log,omitempty"`
+	SenderId    int32                  `protobuf:"varint,3,opt,name=sender_id,json=senderId,proto3" json:"sender_id,omitempty"`
+	ExecutedSeq int32                  `protobuf:"varint,4,opt,name=executed_seq,json=executedSeq,proto3" json:"executed_seq,omitempty"`
+	// Bonus: latest checkpoint info held by the sender
+	LatestCheckpointSeq    int32  `protobuf:"varint,5,opt,name=latest_checkpoint_seq,json=latestCheckpointSeq,proto3" json:"latest_checkpoint_seq,omitempty"`
+	LatestCheckpointDigest []byte `protobuf:"bytes,6,opt,name=latest_checkpoint_digest,json=latestCheckpointDigest,proto3" json:"latest_checkpoint_digest,omitempty"`
+	unknownFields          protoimpl.UnknownFields
+	sizeCache              protoimpl.SizeCache
 }
 
 func (x *Promise) Reset() {
@@ -307,6 +310,20 @@ func (x *Promise) GetExecutedSeq() int32 {
 		return x.ExecutedSeq
 	}
 	return 0
+}
+
+func (x *Promise) GetLatestCheckpointSeq() int32 {
+	if x != nil {
+		return x.LatestCheckpointSeq
+	}
+	return 0
+}
+
+func (x *Promise) GetLatestCheckpointDigest() []byte {
+	if x != nil {
+		return x.LatestCheckpointDigest
+	}
+	return nil
 }
 
 type PrepareAck struct {
@@ -678,11 +695,14 @@ func (x *Commit) GetRequest() *Request {
 }
 
 type NewView struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Ballot        *BallotNumber          `protobuf:"bytes,1,opt,name=ballot,proto3" json:"ballot,omitempty"`
-	AcceptLog     []*AcceptLogEntry      `protobuf:"bytes,2,rep,name=accept_log,json=acceptLog,proto3" json:"accept_log,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	Ballot    *BallotNumber          `protobuf:"bytes,1,opt,name=ballot,proto3" json:"ballot,omitempty"`
+	AcceptLog []*AcceptLogEntry      `protobuf:"bytes,2,rep,name=accept_log,json=acceptLog,proto3" json:"accept_log,omitempty"`
+	// Bonus: base checkpoint for this view
+	BaseCheckpointSeq    int32  `protobuf:"varint,3,opt,name=base_checkpoint_seq,json=baseCheckpointSeq,proto3" json:"base_checkpoint_seq,omitempty"`
+	BaseCheckpointDigest []byte `protobuf:"bytes,4,opt,name=base_checkpoint_digest,json=baseCheckpointDigest,proto3" json:"base_checkpoint_digest,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *NewView) Reset() {
@@ -725,6 +745,20 @@ func (x *NewView) GetBallot() *BallotNumber {
 func (x *NewView) GetAcceptLog() []*AcceptLogEntry {
 	if x != nil {
 		return x.AcceptLog
+	}
+	return nil
+}
+
+func (x *NewView) GetBaseCheckpointSeq() int32 {
+	if x != nil {
+		return x.BaseCheckpointSeq
+	}
+	return 0
+}
+
+func (x *NewView) GetBaseCheckpointDigest() []byte {
+	if x != nil {
+		return x.BaseCheckpointDigest
 	}
 	return nil
 }
@@ -805,6 +839,179 @@ func (x *Reply) GetMessage() string {
 	return ""
 }
 
+// Bonus: checkpointing messages
+type Checkpoint struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Seq           int32                  `protobuf:"varint,1,opt,name=seq,proto3" json:"seq,omitempty"`      // highest executed sequence covered
+	Digest        []byte                 `protobuf:"bytes,2,opt,name=digest,proto3" json:"digest,omitempty"` // SHA-256 of state bytes
+	State         []byte                 `protobuf:"bytes,3,opt,name=state,proto3" json:"state,omitempty"`   // optional raw snapshot bytes (may be empty)
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Checkpoint) Reset() {
+	*x = Checkpoint{}
+	mi := &file_proto_paxos_proto_msgTypes[13]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Checkpoint) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Checkpoint) ProtoMessage() {}
+
+func (x *Checkpoint) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_paxos_proto_msgTypes[13]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Checkpoint.ProtoReflect.Descriptor instead.
+func (*Checkpoint) Descriptor() ([]byte, []int) {
+	return file_proto_paxos_proto_rawDescGZIP(), []int{13}
+}
+
+func (x *Checkpoint) GetSeq() int32 {
+	if x != nil {
+		return x.Seq
+	}
+	return 0
+}
+
+func (x *Checkpoint) GetDigest() []byte {
+	if x != nil {
+		return x.Digest
+	}
+	return nil
+}
+
+func (x *Checkpoint) GetState() []byte {
+	if x != nil {
+		return x.State
+	}
+	return nil
+}
+
+type CheckpointRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Seq           int32                  `protobuf:"varint,1,opt,name=seq,proto3" json:"seq,omitempty"`
+	Digest        []byte                 `protobuf:"bytes,2,opt,name=digest,proto3" json:"digest,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CheckpointRequest) Reset() {
+	*x = CheckpointRequest{}
+	mi := &file_proto_paxos_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CheckpointRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CheckpointRequest) ProtoMessage() {}
+
+func (x *CheckpointRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_paxos_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CheckpointRequest.ProtoReflect.Descriptor instead.
+func (*CheckpointRequest) Descriptor() ([]byte, []int) {
+	return file_proto_paxos_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *CheckpointRequest) GetSeq() int32 {
+	if x != nil {
+		return x.Seq
+	}
+	return 0
+}
+
+func (x *CheckpointRequest) GetDigest() []byte {
+	if x != nil {
+		return x.Digest
+	}
+	return nil
+}
+
+type CheckpointSnapshot struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Seq           int32                  `protobuf:"varint,1,opt,name=seq,proto3" json:"seq,omitempty"`
+	State         []byte                 `protobuf:"bytes,2,opt,name=state,proto3" json:"state,omitempty"`
+	Digest        []byte                 `protobuf:"bytes,3,opt,name=digest,proto3" json:"digest,omitempty"` // repeated for verification convenience
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CheckpointSnapshot) Reset() {
+	*x = CheckpointSnapshot{}
+	mi := &file_proto_paxos_proto_msgTypes[15]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CheckpointSnapshot) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CheckpointSnapshot) ProtoMessage() {}
+
+func (x *CheckpointSnapshot) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_paxos_proto_msgTypes[15]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CheckpointSnapshot.ProtoReflect.Descriptor instead.
+func (*CheckpointSnapshot) Descriptor() ([]byte, []int) {
+	return file_proto_paxos_proto_rawDescGZIP(), []int{15}
+}
+
+func (x *CheckpointSnapshot) GetSeq() int32 {
+	if x != nil {
+		return x.Seq
+	}
+	return 0
+}
+
+func (x *CheckpointSnapshot) GetState() []byte {
+	if x != nil {
+		return x.State
+	}
+	return nil
+}
+
+func (x *CheckpointSnapshot) GetDigest() []byte {
+	if x != nil {
+		return x.Digest
+	}
+	return nil
+}
+
 // Node information
 type NodeInfo struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
@@ -817,7 +1024,7 @@ type NodeInfo struct {
 
 func (x *NodeInfo) Reset() {
 	*x = NodeInfo{}
-	mi := &file_proto_paxos_proto_msgTypes[13]
+	mi := &file_proto_paxos_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -829,7 +1036,7 @@ func (x *NodeInfo) String() string {
 func (*NodeInfo) ProtoMessage() {}
 
 func (x *NodeInfo) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_paxos_proto_msgTypes[13]
+	mi := &file_proto_paxos_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -842,7 +1049,7 @@ func (x *NodeInfo) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeInfo.ProtoReflect.Descriptor instead.
 func (*NodeInfo) Descriptor() ([]byte, []int) {
-	return file_proto_paxos_proto_rawDescGZIP(), []int{13}
+	return file_proto_paxos_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *NodeInfo) GetNodeId() int32 {
@@ -878,7 +1085,7 @@ type ClientInfo struct {
 
 func (x *ClientInfo) Reset() {
 	*x = ClientInfo{}
-	mi := &file_proto_paxos_proto_msgTypes[14]
+	mi := &file_proto_paxos_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -890,7 +1097,7 @@ func (x *ClientInfo) String() string {
 func (*ClientInfo) ProtoMessage() {}
 
 func (x *ClientInfo) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_paxos_proto_msgTypes[14]
+	mi := &file_proto_paxos_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -903,7 +1110,7 @@ func (x *ClientInfo) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ClientInfo.ProtoReflect.Descriptor instead.
 func (*ClientInfo) Descriptor() ([]byte, []int) {
-	return file_proto_paxos_proto_rawDescGZIP(), []int{14}
+	return file_proto_paxos_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *ClientInfo) GetClientId() string {
@@ -939,7 +1146,7 @@ type SystemConfig struct {
 
 func (x *SystemConfig) Reset() {
 	*x = SystemConfig{}
-	mi := &file_proto_paxos_proto_msgTypes[15]
+	mi := &file_proto_paxos_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -951,7 +1158,7 @@ func (x *SystemConfig) String() string {
 func (*SystemConfig) ProtoMessage() {}
 
 func (x *SystemConfig) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_paxos_proto_msgTypes[15]
+	mi := &file_proto_paxos_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -964,7 +1171,7 @@ func (x *SystemConfig) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SystemConfig.ProtoReflect.Descriptor instead.
 func (*SystemConfig) Descriptor() ([]byte, []int) {
-	return file_proto_paxos_proto_rawDescGZIP(), []int{15}
+	return file_proto_paxos_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *SystemConfig) GetNodes() []*NodeInfo {
@@ -990,16 +1197,18 @@ func (x *SystemConfig) GetF() int32 {
 
 // Status messages
 type Status struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Status        string                 `protobuf:"bytes,1,opt,name=status,proto3" json:"status,omitempty"`
-	Message       string                 `protobuf:"bytes,2,opt,name=message,proto3" json:"message,omitempty"`
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	Status  string                 `protobuf:"bytes,1,opt,name=status,proto3" json:"status,omitempty"`
+	Message string                 `protobuf:"bytes,2,opt,name=message,proto3" json:"message,omitempty"`
+	// Optional: hint to clients about known leader
+	LeaderId      int32 `protobuf:"varint,3,opt,name=leader_id,json=leaderId,proto3" json:"leader_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *Status) Reset() {
 	*x = Status{}
-	mi := &file_proto_paxos_proto_msgTypes[16]
+	mi := &file_proto_paxos_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1011,7 +1220,7 @@ func (x *Status) String() string {
 func (*Status) ProtoMessage() {}
 
 func (x *Status) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_paxos_proto_msgTypes[16]
+	mi := &file_proto_paxos_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1024,7 +1233,7 @@ func (x *Status) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Status.ProtoReflect.Descriptor instead.
 func (*Status) Descriptor() ([]byte, []int) {
-	return file_proto_paxos_proto_rawDescGZIP(), []int{16}
+	return file_proto_paxos_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *Status) GetStatus() string {
@@ -1041,6 +1250,13 @@ func (x *Status) GetMessage() string {
 	return ""
 }
 
+func (x *Status) GetLeaderId() int32 {
+	if x != nil {
+		return x.LeaderId
+	}
+	return 0
+}
+
 // Empty message for simple RPC calls
 type Empty struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
@@ -1050,7 +1266,7 @@ type Empty struct {
 
 func (x *Empty) Reset() {
 	*x = Empty{}
-	mi := &file_proto_paxos_proto_msgTypes[17]
+	mi := &file_proto_paxos_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1062,7 +1278,7 @@ func (x *Empty) String() string {
 func (*Empty) ProtoMessage() {}
 
 func (x *Empty) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_paxos_proto_msgTypes[17]
+	mi := &file_proto_paxos_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1075,7 +1291,7 @@ func (x *Empty) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Empty.ProtoReflect.Descriptor instead.
 func (*Empty) Descriptor() ([]byte, []int) {
-	return file_proto_paxos_proto_rawDescGZIP(), []int{17}
+	return file_proto_paxos_proto_rawDescGZIP(), []int{20}
 }
 
 // PrintStatus request message
@@ -1088,7 +1304,7 @@ type PrintStatusRequest struct {
 
 func (x *PrintStatusRequest) Reset() {
 	*x = PrintStatusRequest{}
-	mi := &file_proto_paxos_proto_msgTypes[18]
+	mi := &file_proto_paxos_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1100,7 +1316,7 @@ func (x *PrintStatusRequest) String() string {
 func (*PrintStatusRequest) ProtoMessage() {}
 
 func (x *PrintStatusRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_paxos_proto_msgTypes[18]
+	mi := &file_proto_paxos_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1113,7 +1329,7 @@ func (x *PrintStatusRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PrintStatusRequest.ProtoReflect.Descriptor instead.
 func (*PrintStatusRequest) Descriptor() ([]byte, []int) {
-	return file_proto_paxos_proto_rawDescGZIP(), []int{18}
+	return file_proto_paxos_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *PrintStatusRequest) GetSequenceNumber() int32 {
@@ -1140,13 +1356,15 @@ const file_proto_paxos_proto_rawDesc = "" +
 	"\ttimestamp\x18\x02 \x01(\x03R\ttimestamp\x124\n" +
 	"\vtransaction\x18\x03 \x01(\v2\x12.paxos.TransactionR\vtransaction\"6\n" +
 	"\aPrepare\x12+\n" +
-	"\x06ballot\x18\x01 \x01(\v2\x13.paxos.BallotNumberR\x06ballot\"\xac\x01\n" +
+	"\x06ballot\x18\x01 \x01(\v2\x13.paxos.BallotNumberR\x06ballot\"\x9a\x02\n" +
 	"\aPromise\x12+\n" +
 	"\x06ballot\x18\x01 \x01(\v2\x13.paxos.BallotNumberR\x06ballot\x124\n" +
 	"\n" +
 	"accept_log\x18\x02 \x03(\v2\x15.paxos.AcceptLogEntryR\tacceptLog\x12\x1b\n" +
 	"\tsender_id\x18\x03 \x01(\x05R\bsenderId\x12!\n" +
-	"\fexecuted_seq\x18\x04 \x01(\x05R\vexecutedSeq\"k\n" +
+	"\fexecuted_seq\x18\x04 \x01(\x05R\vexecutedSeq\x122\n" +
+	"\x15latest_checkpoint_seq\x18\x05 \x01(\x05R\x13latestCheckpointSeq\x128\n" +
+	"\x18latest_checkpoint_digest\x18\x06 \x01(\fR\x16latestCheckpointDigest\"k\n" +
 	"\n" +
 	"PrepareAck\x12+\n" +
 	"\x06ballot\x18\x01 \x01(\v2\x13.paxos.BallotNumberR\x06ballot\x12\x16\n" +
@@ -1175,17 +1393,31 @@ const file_proto_paxos_proto_rawDesc = "" +
 	"\x06Commit\x12+\n" +
 	"\x06ballot\x18\x01 \x01(\v2\x13.paxos.BallotNumberR\x06ballot\x12\x1a\n" +
 	"\bsequence\x18\x02 \x01(\x05R\bsequence\x12(\n" +
-	"\arequest\x18\x03 \x01(\v2\x0e.paxos.RequestR\arequest\"l\n" +
+	"\arequest\x18\x03 \x01(\v2\x0e.paxos.RequestR\arequest\"\xd2\x01\n" +
 	"\aNewView\x12+\n" +
 	"\x06ballot\x18\x01 \x01(\v2\x13.paxos.BallotNumberR\x06ballot\x124\n" +
 	"\n" +
-	"accept_log\x18\x02 \x03(\v2\x15.paxos.AcceptLogEntryR\tacceptLog\"\xa1\x01\n" +
+	"accept_log\x18\x02 \x03(\v2\x15.paxos.AcceptLogEntryR\tacceptLog\x12.\n" +
+	"\x13base_checkpoint_seq\x18\x03 \x01(\x05R\x11baseCheckpointSeq\x124\n" +
+	"\x16base_checkpoint_digest\x18\x04 \x01(\fR\x14baseCheckpointDigest\"\xa1\x01\n" +
 	"\x05Reply\x12+\n" +
 	"\x06ballot\x18\x01 \x01(\v2\x13.paxos.BallotNumberR\x06ballot\x12\x1c\n" +
 	"\ttimestamp\x18\x02 \x01(\x03R\ttimestamp\x12\x1b\n" +
 	"\tclient_id\x18\x03 \x01(\tR\bclientId\x12\x16\n" +
 	"\x06result\x18\x04 \x01(\bR\x06result\x12\x18\n" +
-	"\amessage\x18\x05 \x01(\tR\amessage\"Q\n" +
+	"\amessage\x18\x05 \x01(\tR\amessage\"L\n" +
+	"\n" +
+	"Checkpoint\x12\x10\n" +
+	"\x03seq\x18\x01 \x01(\x05R\x03seq\x12\x16\n" +
+	"\x06digest\x18\x02 \x01(\fR\x06digest\x12\x14\n" +
+	"\x05state\x18\x03 \x01(\fR\x05state\"=\n" +
+	"\x11CheckpointRequest\x12\x10\n" +
+	"\x03seq\x18\x01 \x01(\x05R\x03seq\x12\x16\n" +
+	"\x06digest\x18\x02 \x01(\fR\x06digest\"T\n" +
+	"\x12CheckpointSnapshot\x12\x10\n" +
+	"\x03seq\x18\x01 \x01(\x05R\x03seq\x12\x14\n" +
+	"\x05state\x18\x02 \x01(\fR\x05state\x12\x16\n" +
+	"\x06digest\x18\x03 \x01(\fR\x06digest\"Q\n" +
 	"\bNodeInfo\x12\x17\n" +
 	"\anode_id\x18\x01 \x01(\x05R\x06nodeId\x12\x18\n" +
 	"\aaddress\x18\x02 \x01(\tR\aaddress\x12\x12\n" +
@@ -1198,20 +1430,21 @@ const file_proto_paxos_proto_rawDesc = "" +
 	"\fSystemConfig\x12%\n" +
 	"\x05nodes\x18\x01 \x03(\v2\x0f.paxos.NodeInfoR\x05nodes\x12+\n" +
 	"\aclients\x18\x02 \x03(\v2\x11.paxos.ClientInfoR\aclients\x12\f\n" +
-	"\x01f\x18\x03 \x01(\x05R\x01f\":\n" +
+	"\x01f\x18\x03 \x01(\x05R\x01f\"W\n" +
 	"\x06Status\x12\x16\n" +
 	"\x06status\x18\x01 \x01(\tR\x06status\x12\x18\n" +
-	"\amessage\x18\x02 \x01(\tR\amessage\"\a\n" +
+	"\amessage\x18\x02 \x01(\tR\amessage\x12\x1b\n" +
+	"\tleader_id\x18\x03 \x01(\x05R\bleaderId\"\a\n" +
 	"\x05Empty\"=\n" +
 	"\x12PrintStatusRequest\x12'\n" +
-	"\x0fsequence_number\x18\x01 \x01(\x05R\x0esequenceNumber2\x99\x02\n" +
-	"\fPaxosService\x12+\n" +
-	"\vSendRequest\x12\x0e.paxos.Request\x1a\f.paxos.Reply\x12(\n" +
+	"\x0fsequence_number\x18\x01 \x01(\x05R\x0esequenceNumber2\x9a\x02\n" +
+	"\fPaxosService\x12,\n" +
+	"\vSendRequest\x12\x0e.paxos.Request\x1a\r.paxos.Status\x12(\n" +
 	"\tGetStatus\x12\f.paxos.Empty\x1a\r.paxos.Status\x12'\n" +
 	"\bPrintLog\x12\f.paxos.Empty\x1a\r.paxos.Status\x12&\n" +
 	"\aPrintDB\x12\f.paxos.Empty\x1a\r.paxos.Status\x127\n" +
 	"\vPrintStatus\x12\x19.paxos.PrintStatusRequest\x1a\r.paxos.Status\x12(\n" +
-	"\tPrintView\x12\f.paxos.Empty\x1a\r.paxos.Status2\xbe\x03\n" +
+	"\tPrintView\x12\f.paxos.Empty\x1a\r.paxos.Status2\xbc\x04\n" +
 	"\vNodeService\x122\n" +
 	"\rHandlePrepare\x12\x0e.paxos.Prepare\x1a\x11.paxos.PrepareAck\x12.\n" +
 	"\rHandlePromise\x12\x0e.paxos.Promise\x1a\r.paxos.Status\x12/\n" +
@@ -1221,7 +1454,9 @@ const file_proto_paxos_proto_rawDesc = "" +
 	"\rHandleNewView\x12\x0e.paxos.NewView\x1a\r.paxos.Status\x12.\n" +
 	"\rHandleRequest\x12\x0e.paxos.Request\x1a\r.paxos.Status\x12.\n" +
 	"\x0eRequestNewView\x12\f.paxos.Empty\x1a\x0e.paxos.NewView\x12*\n" +
-	"\tGetLeader\x12\f.paxos.Empty\x1a\x0f.paxos.NodeInfo29\n" +
+	"\tGetLeader\x12\f.paxos.Empty\x1a\x0f.paxos.NodeInfo\x122\n" +
+	"\x0eSendCheckpoint\x12\x11.paxos.Checkpoint\x1a\r.paxos.Status\x12H\n" +
+	"\x11RequestCheckpoint\x12\x18.paxos.CheckpointRequest\x1a\x19.paxos.CheckpointSnapshot29\n" +
 	"\rClientService\x12(\n" +
 	"\tSendReply\x12\f.paxos.Reply\x1a\r.paxos.StatusB\tZ\a./protob\x06proto3"
 
@@ -1237,7 +1472,7 @@ func file_proto_paxos_proto_rawDescGZIP() []byte {
 	return file_proto_paxos_proto_rawDescData
 }
 
-var file_proto_paxos_proto_msgTypes = make([]protoimpl.MessageInfo, 19)
+var file_proto_paxos_proto_msgTypes = make([]protoimpl.MessageInfo, 22)
 var file_proto_paxos_proto_goTypes = []any{
 	(*BallotNumber)(nil),       // 0: paxos.BallotNumber
 	(*Transaction)(nil),        // 1: paxos.Transaction
@@ -1252,12 +1487,15 @@ var file_proto_paxos_proto_goTypes = []any{
 	(*Commit)(nil),             // 10: paxos.Commit
 	(*NewView)(nil),            // 11: paxos.NewView
 	(*Reply)(nil),              // 12: paxos.Reply
-	(*NodeInfo)(nil),           // 13: paxos.NodeInfo
-	(*ClientInfo)(nil),         // 14: paxos.ClientInfo
-	(*SystemConfig)(nil),       // 15: paxos.SystemConfig
-	(*Status)(nil),             // 16: paxos.Status
-	(*Empty)(nil),              // 17: paxos.Empty
-	(*PrintStatusRequest)(nil), // 18: paxos.PrintStatusRequest
+	(*Checkpoint)(nil),         // 13: paxos.Checkpoint
+	(*CheckpointRequest)(nil),  // 14: paxos.CheckpointRequest
+	(*CheckpointSnapshot)(nil), // 15: paxos.CheckpointSnapshot
+	(*NodeInfo)(nil),           // 16: paxos.NodeInfo
+	(*ClientInfo)(nil),         // 17: paxos.ClientInfo
+	(*SystemConfig)(nil),       // 18: paxos.SystemConfig
+	(*Status)(nil),             // 19: paxos.Status
+	(*Empty)(nil),              // 20: paxos.Empty
+	(*PrintStatusRequest)(nil), // 21: paxos.PrintStatusRequest
 }
 var file_proto_paxos_proto_depIdxs = []int32{
 	1,  // 0: paxos.Request.transaction:type_name -> paxos.Transaction
@@ -1276,14 +1514,14 @@ var file_proto_paxos_proto_depIdxs = []int32{
 	0,  // 13: paxos.NewView.ballot:type_name -> paxos.BallotNumber
 	6,  // 14: paxos.NewView.accept_log:type_name -> paxos.AcceptLogEntry
 	0,  // 15: paxos.Reply.ballot:type_name -> paxos.BallotNumber
-	13, // 16: paxos.SystemConfig.nodes:type_name -> paxos.NodeInfo
-	14, // 17: paxos.SystemConfig.clients:type_name -> paxos.ClientInfo
+	16, // 16: paxos.SystemConfig.nodes:type_name -> paxos.NodeInfo
+	17, // 17: paxos.SystemConfig.clients:type_name -> paxos.ClientInfo
 	2,  // 18: paxos.PaxosService.SendRequest:input_type -> paxos.Request
-	17, // 19: paxos.PaxosService.GetStatus:input_type -> paxos.Empty
-	17, // 20: paxos.PaxosService.PrintLog:input_type -> paxos.Empty
-	17, // 21: paxos.PaxosService.PrintDB:input_type -> paxos.Empty
-	18, // 22: paxos.PaxosService.PrintStatus:input_type -> paxos.PrintStatusRequest
-	17, // 23: paxos.PaxosService.PrintView:input_type -> paxos.Empty
+	20, // 19: paxos.PaxosService.GetStatus:input_type -> paxos.Empty
+	20, // 20: paxos.PaxosService.PrintLog:input_type -> paxos.Empty
+	20, // 21: paxos.PaxosService.PrintDB:input_type -> paxos.Empty
+	21, // 22: paxos.PaxosService.PrintStatus:input_type -> paxos.PrintStatusRequest
+	20, // 23: paxos.PaxosService.PrintView:input_type -> paxos.Empty
 	3,  // 24: paxos.NodeService.HandlePrepare:input_type -> paxos.Prepare
 	4,  // 25: paxos.NodeService.HandlePromise:input_type -> paxos.Promise
 	7,  // 26: paxos.NodeService.HandleAccept:input_type -> paxos.Accept
@@ -1291,27 +1529,31 @@ var file_proto_paxos_proto_depIdxs = []int32{
 	10, // 28: paxos.NodeService.HandleCommit:input_type -> paxos.Commit
 	11, // 29: paxos.NodeService.HandleNewView:input_type -> paxos.NewView
 	2,  // 30: paxos.NodeService.HandleRequest:input_type -> paxos.Request
-	17, // 31: paxos.NodeService.RequestNewView:input_type -> paxos.Empty
-	17, // 32: paxos.NodeService.GetLeader:input_type -> paxos.Empty
-	12, // 33: paxos.ClientService.SendReply:input_type -> paxos.Reply
-	12, // 34: paxos.PaxosService.SendRequest:output_type -> paxos.Reply
-	16, // 35: paxos.PaxosService.GetStatus:output_type -> paxos.Status
-	16, // 36: paxos.PaxosService.PrintLog:output_type -> paxos.Status
-	16, // 37: paxos.PaxosService.PrintDB:output_type -> paxos.Status
-	16, // 38: paxos.PaxosService.PrintStatus:output_type -> paxos.Status
-	16, // 39: paxos.PaxosService.PrintView:output_type -> paxos.Status
-	5,  // 40: paxos.NodeService.HandlePrepare:output_type -> paxos.PrepareAck
-	16, // 41: paxos.NodeService.HandlePromise:output_type -> paxos.Status
-	8,  // 42: paxos.NodeService.HandleAccept:output_type -> paxos.AcceptAck
-	16, // 43: paxos.NodeService.HandleAccepted:output_type -> paxos.Status
-	16, // 44: paxos.NodeService.HandleCommit:output_type -> paxos.Status
-	16, // 45: paxos.NodeService.HandleNewView:output_type -> paxos.Status
-	16, // 46: paxos.NodeService.HandleRequest:output_type -> paxos.Status
-	11, // 47: paxos.NodeService.RequestNewView:output_type -> paxos.NewView
-	13, // 48: paxos.NodeService.GetLeader:output_type -> paxos.NodeInfo
-	16, // 49: paxos.ClientService.SendReply:output_type -> paxos.Status
-	34, // [34:50] is the sub-list for method output_type
-	18, // [18:34] is the sub-list for method input_type
+	20, // 31: paxos.NodeService.RequestNewView:input_type -> paxos.Empty
+	20, // 32: paxos.NodeService.GetLeader:input_type -> paxos.Empty
+	13, // 33: paxos.NodeService.SendCheckpoint:input_type -> paxos.Checkpoint
+	14, // 34: paxos.NodeService.RequestCheckpoint:input_type -> paxos.CheckpointRequest
+	12, // 35: paxos.ClientService.SendReply:input_type -> paxos.Reply
+	19, // 36: paxos.PaxosService.SendRequest:output_type -> paxos.Status
+	19, // 37: paxos.PaxosService.GetStatus:output_type -> paxos.Status
+	19, // 38: paxos.PaxosService.PrintLog:output_type -> paxos.Status
+	19, // 39: paxos.PaxosService.PrintDB:output_type -> paxos.Status
+	19, // 40: paxos.PaxosService.PrintStatus:output_type -> paxos.Status
+	19, // 41: paxos.PaxosService.PrintView:output_type -> paxos.Status
+	5,  // 42: paxos.NodeService.HandlePrepare:output_type -> paxos.PrepareAck
+	19, // 43: paxos.NodeService.HandlePromise:output_type -> paxos.Status
+	8,  // 44: paxos.NodeService.HandleAccept:output_type -> paxos.AcceptAck
+	19, // 45: paxos.NodeService.HandleAccepted:output_type -> paxos.Status
+	19, // 46: paxos.NodeService.HandleCommit:output_type -> paxos.Status
+	19, // 47: paxos.NodeService.HandleNewView:output_type -> paxos.Status
+	19, // 48: paxos.NodeService.HandleRequest:output_type -> paxos.Status
+	11, // 49: paxos.NodeService.RequestNewView:output_type -> paxos.NewView
+	16, // 50: paxos.NodeService.GetLeader:output_type -> paxos.NodeInfo
+	19, // 51: paxos.NodeService.SendCheckpoint:output_type -> paxos.Status
+	15, // 52: paxos.NodeService.RequestCheckpoint:output_type -> paxos.CheckpointSnapshot
+	19, // 53: paxos.ClientService.SendReply:output_type -> paxos.Status
+	36, // [36:54] is the sub-list for method output_type
+	18, // [18:36] is the sub-list for method input_type
 	18, // [18:18] is the sub-list for extension type_name
 	18, // [18:18] is the sub-list for extension extendee
 	0,  // [0:18] is the sub-list for field type_name
@@ -1328,7 +1570,7 @@ func file_proto_paxos_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_paxos_proto_rawDesc), len(file_proto_paxos_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   19,
+			NumMessages:   22,
 			NumExtensions: 0,
 			NumServices:   3,
 		},

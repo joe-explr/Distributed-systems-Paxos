@@ -10,19 +10,16 @@ import (
 	"strings"
 )
 
-// CSVTestParser handles parsing of CSV test files
 type CSVTestParser struct {
 	filePath string
 }
 
-// NewCSVTestParser creates a new CSV test parser
 func NewCSVTestParser(filePath string) *CSVTestParser {
 	return &CSVTestParser{
 		filePath: filePath,
 	}
 }
 
-// ParseTestCases parses the CSV file and returns all test cases
 func (p *CSVTestParser) ParseTestCases() ([]testcase.TestCase, error) {
 	file, err := os.Open(p.filePath)
 	if err != nil {
@@ -40,7 +37,6 @@ func (p *CSVTestParser) ParseTestCases() ([]testcase.TestCase, error) {
 		return nil, fmt.Errorf("CSV file must have at least a header and one data row")
 	}
 
-	// Skip header row
 	records = records[1:]
 
 	var testCases []testcase.TestCase
@@ -48,21 +44,19 @@ func (p *CSVTestParser) ParseTestCases() ([]testcase.TestCase, error) {
 
 	for i, record := range records {
 		if len(record) < 3 {
-			continue // Skip malformed rows
+			continue 
 		}
 
 		setNumberStr := strings.TrimSpace(record[0])
 		transactionStr := strings.TrimSpace(record[1])
 		liveNodesStr := strings.TrimSpace(record[2])
 
-		// Check if this is a new set
 		if setNumberStr != "" {
-			// Save previous test case if exists
+
 			if currentTestCase != nil {
 				testCases = append(testCases, *currentTestCase)
 			}
 
-			// Start new test case
 			setNumber, err := strconv.Atoi(setNumberStr)
 			if err != nil {
 				return nil, fmt.Errorf("invalid set number at row %d: %s", i+2, setNumberStr)
@@ -75,7 +69,6 @@ func (p *CSVTestParser) ParseTestCases() ([]testcase.TestCase, error) {
 				LeaderFails:  []int{},
 			}
 
-			// Parse live nodes for this set
 			if liveNodesStr != "" {
 				nodes, err := p.parseLiveNodes(liveNodesStr)
 				if err != nil {
@@ -85,13 +78,12 @@ func (p *CSVTestParser) ParseTestCases() ([]testcase.TestCase, error) {
 			}
 		}
 
-		// Process transaction or LF command
 		if transactionStr != "" {
 			if transactionStr == "LF" {
-				// Leader fail command
+
 				currentTestCase.LeaderFails = append(currentTestCase.LeaderFails, len(currentTestCase.Transactions))
 			} else {
-				// Parse transaction
+
 				transaction, err := p.parseTransaction(transactionStr)
 				if err != nil {
 					return nil, fmt.Errorf("failed to parse transaction at row %d: %v", i+2, err)
@@ -101,7 +93,6 @@ func (p *CSVTestParser) ParseTestCases() ([]testcase.TestCase, error) {
 		}
 	}
 
-	// Add the last test case
 	if currentTestCase != nil {
 		testCases = append(testCases, *currentTestCase)
 	}
@@ -109,18 +100,15 @@ func (p *CSVTestParser) ParseTestCases() ([]testcase.TestCase, error) {
 	return testCases, nil
 }
 
-// parseTransaction parses a transaction string like "(A, B, 5)"
 func (p *CSVTestParser) parseTransaction(transactionStr string) (testcase.Transaction, error) {
-	// Remove parentheses and split by comma
+
 	cleanStr := strings.TrimSpace(transactionStr)
 	if !strings.HasPrefix(cleanStr, "(") || !strings.HasSuffix(cleanStr, ")") {
 		return testcase.Transaction{}, fmt.Errorf("invalid transaction format: %s", transactionStr)
 	}
 
-	// Remove parentheses
 	cleanStr = cleanStr[1 : len(cleanStr)-1]
 
-	// Split by comma and trim spaces
 	parts := strings.Split(cleanStr, ",")
 	if len(parts) != 3 {
 		return testcase.Transaction{}, fmt.Errorf("transaction must have exactly 3 parts: %s", transactionStr)
@@ -142,9 +130,8 @@ func (p *CSVTestParser) parseTransaction(transactionStr string) (testcase.Transa
 	}, nil
 }
 
-// parseLiveNodes parses live nodes string like "[n1, n2, n3, n4, n5]"
 func (p *CSVTestParser) parseLiveNodes(liveNodesStr string) ([]int32, error) {
-	// Remove brackets
+
 	cleanStr := strings.TrimSpace(liveNodesStr)
 	if !strings.HasPrefix(cleanStr, "[") || !strings.HasSuffix(cleanStr, "]") {
 		return nil, fmt.Errorf("invalid live nodes format: %s", liveNodesStr)
@@ -152,7 +139,6 @@ func (p *CSVTestParser) parseLiveNodes(liveNodesStr string) ([]int32, error) {
 
 	cleanStr = cleanStr[1 : len(cleanStr)-1]
 
-	// Split by comma and parse each node
 	parts := strings.Split(cleanStr, ",")
 	var nodes []int32
 
@@ -162,7 +148,6 @@ func (p *CSVTestParser) parseLiveNodes(liveNodesStr string) ([]int32, error) {
 			continue
 		}
 
-		// Extract node number from "n1", "n2", etc.
 		re := regexp.MustCompile(`n(\d+)`)
 		matches := re.FindStringSubmatch(part)
 		if len(matches) != 2 {

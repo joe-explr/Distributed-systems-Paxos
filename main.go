@@ -785,6 +785,25 @@ func (etcp *EnhancedTestCaseProcessor) ProcessTestCaseWithValidation(testCase te
 		NodeStates:       make(map[int32]bool),
 	}
 
+	err := etcp.setupLiveNodes(testCase.LiveNodes)
+	if err != nil {
+		result.Success = false
+		result.ErrorMessage = fmt.Sprintf("failed to setup live nodes: %v", err)
+		result.ProcessingTime = time.Since(etcp.startTime)
+		etcp.testResults = append(etcp.testResults, result)
+		return result
+	}
+
+	activeNodeCount := etcp.countActiveNodes()
+	if activeNodeCount < 3 {
+		fmt.Printf("WARNING: Only %d active nodes available (minimum required: 3). Exiting current set early.\n", activeNodeCount)
+		result.Success = false
+		result.ErrorMessage = fmt.Sprintf("insufficient active nodes: %d < 3", activeNodeCount)
+		result.ProcessingTime = time.Since(etcp.startTime)
+		etcp.testResults = append(etcp.testResults, result)
+		return result
+	}
+
 	currentBalances := etcp.getCurrentNodeBalances()
 	for clientID, balance := range currentBalances {
 		result.ExpectedBalances[clientID] = balance
@@ -800,7 +819,7 @@ func (etcp *EnhancedTestCaseProcessor) ProcessTestCaseWithValidation(testCase te
 		}
 	}
 
-	err := etcp.processTestCaseInternal(testCase)
+	err = etcp.processTransactionsOnly(testCase)
 	if err != nil {
 		result.Success = false
 		result.ErrorMessage = err.Error()
@@ -838,7 +857,9 @@ func (etcp *EnhancedTestCaseProcessor) processTestCaseInternal(testCase testcase
 			len(testCase.CarriedForwardTransactions), len(testCase.Transactions))
 	}
 
-	err = etcp.processTransactionsWithLeaderFails(allTransactions, testCase.LeaderFails)
+	adjustedLeaderFails := etcp.adjustLeaderFailureIndices(testCase.LeaderFails, len(testCase.CarriedForwardTransactions))
+
+	err = etcp.processTransactionsWithLeaderFails(allTransactions, adjustedLeaderFails)
 	if err != nil {
 		return fmt.Errorf("failed to process transactions: %v", err)
 	}
@@ -851,6 +872,45 @@ func (etcp *EnhancedTestCaseProcessor) processTestCaseInternal(testCase testcase
 	etcp.stopAllTimers()
 
 	return nil
+}
+
+func (etcp *EnhancedTestCaseProcessor) processTransactionsOnly(testCase testcase.TestCase) error {
+
+	allTransactions := append(testCase.CarriedForwardTransactions, testCase.Transactions...)
+	if len(testCase.CarriedForwardTransactions) > 0 {
+		fmt.Printf("Processing %d carried forward transactions + %d new transactions\n",
+			len(testCase.CarriedForwardTransactions), len(testCase.Transactions))
+	}
+
+	adjustedLeaderFails := etcp.adjustLeaderFailureIndices(testCase.LeaderFails, len(testCase.CarriedForwardTransactions))
+
+	err := etcp.processTransactionsWithLeaderFails(allTransactions, adjustedLeaderFails)
+	if err != nil {
+		return fmt.Errorf("failed to process transactions: %v", err)
+	}
+
+	err = etcp.waitForCompletion()
+	if err != nil {
+		return fmt.Errorf("failed to wait for completion: %v", err)
+	}
+
+	etcp.stopAllTimers()
+
+	return nil
+}
+
+func (etcp *EnhancedTestCaseProcessor) adjustLeaderFailureIndices(leaderFails []int, carriedForwardCount int) []int {
+	if carriedForwardCount == 0 || len(leaderFails) == 0 {
+		return leaderFails
+	}
+
+	adjustedFails := make([]int, len(leaderFails))
+	for i, failIndex := range leaderFails {
+		adjustedFails[i] = failIndex + carriedForwardCount
+		fmt.Printf("Leader Fail: Adjusted index %d -> %d (offset by %d carried forward transactions)\n",
+			failIndex, adjustedFails[i], carriedForwardCount)
+	}
+	return adjustedFails
 }
 
 func (etcp *EnhancedTestCaseProcessor) setupLiveNodes(liveNodes []int32) error {
@@ -890,11 +950,18 @@ func (etcp *EnhancedTestCaseProcessor) processTransactionsWithLeaderFails(transa
 
 		if nextLFPos == -1 || nextTransactionPos < nextLFPos {
 
+			leader := etcp.getLeaderNode()
+			var startSequence int32 = 0
+			if leader != nil {
+				startSequence = leader.GetExecutedSequence()
+			}
+
 			endPos := len(transactions)
 			if nextLFPos != -1 {
 				endPos = nextLFPos
 			}
 
+			batchStart := transactionIndex
 			for transactionIndex < endPos {
 				txn := transactions[transactionIndex]
 				fmt.Printf("Processing transaction %d: %s -> %s: $%d\n",
@@ -907,12 +974,28 @@ func (etcp *EnhancedTestCaseProcessor) processTransactionsWithLeaderFails(transa
 
 				transactionIndex++
 			}
+
+			batchSize := transactionIndex - batchStart
+			expectedFinalSequence := startSequence + int32(batchSize)
+
+			_ = expectedFinalSequence 
 		}
 
 		if lfIndex < len(leaderFails) && nextLFPos == transactionIndex {
 			fmt.Printf("Executing Leader Fail command at position %d\n", nextLFPos)
 
-			err := etcp.waitForTransactionsToExecute(transactionIndex)
+			leader := etcp.getLeaderNode()
+			if leader == nil {
+				return fmt.Errorf("no leader found when trying to execute leader fail")
+			}
+
+			targetSequence := leader.GetExecutedSequence()
+
+			time.Sleep(200 * time.Millisecond)
+
+			targetSequence = leader.GetExecutedSequence()
+
+			err := etcp.waitForSequenceToExecute(targetSequence)
 			if err != nil {
 				return fmt.Errorf("failed to wait for transactions to execute: %v", err)
 			}
@@ -924,10 +1007,9 @@ func (etcp *EnhancedTestCaseProcessor) processTransactionsWithLeaderFails(transa
 				return fmt.Errorf("failed to execute leader fail: %v", err)
 			}
 
-			err = etcp.waitForNewLeader()
-			if err != nil {
-				return fmt.Errorf("new leader not elected after failure: %v", err)
-			}
+			fmt.Println("Leader failed - waiting for system to settle before continuing...")
+			time.Sleep(3 * time.Second)
+			fmt.Println("Continuing with transaction processing - clients will trigger new election through retries")
 
 			lfIndex++
 		}
@@ -1075,12 +1157,21 @@ func (etcp *EnhancedTestCaseProcessor) waitForCompletion() error {
 	return nil
 }
 
-func (etcp *EnhancedTestCaseProcessor) waitForTransactionsToExecute(transactionCount int) error {
-	if transactionCount == 0 {
+func (etcp *EnhancedTestCaseProcessor) getLeaderNode() *node.Node {
+	for _, n := range etcp.nodes {
+		if n.IsNodeActive() && n.IsNodeLeader() {
+			return n
+		}
+	}
+	return nil
+}
+
+func (etcp *EnhancedTestCaseProcessor) waitForSequenceToExecute(targetSequence int32) error {
+	if targetSequence == 0 {
 		return nil
 	}
 
-	fmt.Printf("Waiting for %d transactions to reach executed stage...\n", transactionCount)
+	fmt.Printf("Waiting for all active nodes to execute up to sequence %d...\n", targetSequence)
 
 	maxWaitTime := 30 * time.Second
 	checkInterval := 100 * time.Millisecond
@@ -1089,33 +1180,32 @@ func (etcp *EnhancedTestCaseProcessor) waitForTransactionsToExecute(transactionC
 	for time.Since(startTime) < maxWaitTime {
 		allExecuted := true
 
-		for i := 1; i <= transactionCount; i++ {
-			sequenceNumber := int32(i)
-
-			executedOnAllNodes := true
-			for _, node := range etcp.nodes {
-				if !node.IsNodeActive() {
-					continue
-				}
-
-				if !node.IsTransactionFullyCompleted(sequenceNumber) {
-					executedOnAllNodes = false
-					break
-				}
+		for _, node := range etcp.nodes {
+			if !node.IsNodeActive() {
+				continue
 			}
 
-			if !executedOnAllNodes {
+			executedSeq := node.GetExecutedSequence()
+			if executedSeq < targetSequence {
 				allExecuted = false
 				break
 			}
 		}
 
 		if allExecuted {
-			fmt.Printf("All %d transactions have reached executed stage\n", transactionCount)
+			fmt.Printf("All active nodes have executed up to sequence %d\n", targetSequence)
 			return nil
 		}
 
 		time.Sleep(checkInterval)
+	}
+
+	fmt.Println("Timeout - Current execution state:")
+	for _, node := range etcp.nodes {
+		if node.IsNodeActive() {
+			fmt.Printf("  Node %d: executed=%d (target=%d)\n",
+				node.ID, node.GetExecutedSequence(), targetSequence)
+		}
 	}
 
 	return fmt.Errorf("timeout waiting for transactions to execute after %v", maxWaitTime)

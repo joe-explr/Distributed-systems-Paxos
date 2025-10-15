@@ -34,7 +34,7 @@ const (
 // Client-facing service - only what clients need
 type PaxosServiceClient interface {
 	// Client to Node communication
-	SendRequest(ctx context.Context, in *Request, opts ...grpc.CallOption) (*Reply, error)
+	SendRequest(ctx context.Context, in *Request, opts ...grpc.CallOption) (*Status, error)
 	// Utility functions (if clients need them)
 	GetStatus(ctx context.Context, in *Empty, opts ...grpc.CallOption) (*Status, error)
 	PrintLog(ctx context.Context, in *Empty, opts ...grpc.CallOption) (*Status, error)
@@ -51,9 +51,9 @@ func NewPaxosServiceClient(cc grpc.ClientConnInterface) PaxosServiceClient {
 	return &paxosServiceClient{cc}
 }
 
-func (c *paxosServiceClient) SendRequest(ctx context.Context, in *Request, opts ...grpc.CallOption) (*Reply, error) {
+func (c *paxosServiceClient) SendRequest(ctx context.Context, in *Request, opts ...grpc.CallOption) (*Status, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(Reply)
+	out := new(Status)
 	err := c.cc.Invoke(ctx, PaxosService_SendRequest_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
@@ -118,7 +118,7 @@ func (c *paxosServiceClient) PrintView(ctx context.Context, in *Empty, opts ...g
 // Client-facing service - only what clients need
 type PaxosServiceServer interface {
 	// Client to Node communication
-	SendRequest(context.Context, *Request) (*Reply, error)
+	SendRequest(context.Context, *Request) (*Status, error)
 	// Utility functions (if clients need them)
 	GetStatus(context.Context, *Empty) (*Status, error)
 	PrintLog(context.Context, *Empty) (*Status, error)
@@ -135,7 +135,7 @@ type PaxosServiceServer interface {
 // pointer dereference when methods are called.
 type UnimplementedPaxosServiceServer struct{}
 
-func (UnimplementedPaxosServiceServer) SendRequest(context.Context, *Request) (*Reply, error) {
+func (UnimplementedPaxosServiceServer) SendRequest(context.Context, *Request) (*Status, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method SendRequest not implemented")
 }
 func (UnimplementedPaxosServiceServer) GetStatus(context.Context, *Empty) (*Status, error) {
@@ -319,15 +319,17 @@ var PaxosService_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
-	NodeService_HandlePrepare_FullMethodName  = "/paxos.NodeService/HandlePrepare"
-	NodeService_HandlePromise_FullMethodName  = "/paxos.NodeService/HandlePromise"
-	NodeService_HandleAccept_FullMethodName   = "/paxos.NodeService/HandleAccept"
-	NodeService_HandleAccepted_FullMethodName = "/paxos.NodeService/HandleAccepted"
-	NodeService_HandleCommit_FullMethodName   = "/paxos.NodeService/HandleCommit"
-	NodeService_HandleNewView_FullMethodName  = "/paxos.NodeService/HandleNewView"
-	NodeService_HandleRequest_FullMethodName  = "/paxos.NodeService/HandleRequest"
-	NodeService_RequestNewView_FullMethodName = "/paxos.NodeService/RequestNewView"
-	NodeService_GetLeader_FullMethodName      = "/paxos.NodeService/GetLeader"
+	NodeService_HandlePrepare_FullMethodName     = "/paxos.NodeService/HandlePrepare"
+	NodeService_HandlePromise_FullMethodName     = "/paxos.NodeService/HandlePromise"
+	NodeService_HandleAccept_FullMethodName      = "/paxos.NodeService/HandleAccept"
+	NodeService_HandleAccepted_FullMethodName    = "/paxos.NodeService/HandleAccepted"
+	NodeService_HandleCommit_FullMethodName      = "/paxos.NodeService/HandleCommit"
+	NodeService_HandleNewView_FullMethodName     = "/paxos.NodeService/HandleNewView"
+	NodeService_HandleRequest_FullMethodName     = "/paxos.NodeService/HandleRequest"
+	NodeService_RequestNewView_FullMethodName    = "/paxos.NodeService/RequestNewView"
+	NodeService_GetLeader_FullMethodName         = "/paxos.NodeService/GetLeader"
+	NodeService_SendCheckpoint_FullMethodName    = "/paxos.NodeService/SendCheckpoint"
+	NodeService_RequestCheckpoint_FullMethodName = "/paxos.NodeService/RequestCheckpoint"
 )
 
 // NodeServiceClient is the client API for NodeService service.
@@ -349,6 +351,9 @@ type NodeServiceClient interface {
 	RequestNewView(ctx context.Context, in *Empty, opts ...grpc.CallOption) (*NewView, error)
 	// leader discovery
 	GetLeader(ctx context.Context, in *Empty, opts ...grpc.CallOption) (*NodeInfo, error)
+	// Bonus: checkpoint distribution
+	SendCheckpoint(ctx context.Context, in *Checkpoint, opts ...grpc.CallOption) (*Status, error)
+	RequestCheckpoint(ctx context.Context, in *CheckpointRequest, opts ...grpc.CallOption) (*CheckpointSnapshot, error)
 }
 
 type nodeServiceClient struct {
@@ -449,6 +454,26 @@ func (c *nodeServiceClient) GetLeader(ctx context.Context, in *Empty, opts ...gr
 	return out, nil
 }
 
+func (c *nodeServiceClient) SendCheckpoint(ctx context.Context, in *Checkpoint, opts ...grpc.CallOption) (*Status, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(Status)
+	err := c.cc.Invoke(ctx, NodeService_SendCheckpoint_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *nodeServiceClient) RequestCheckpoint(ctx context.Context, in *CheckpointRequest, opts ...grpc.CallOption) (*CheckpointSnapshot, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CheckpointSnapshot)
+	err := c.cc.Invoke(ctx, NodeService_RequestCheckpoint_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // NodeServiceServer is the server API for NodeService service.
 // All implementations must embed UnimplementedNodeServiceServer
 // for forward compatibility.
@@ -468,6 +493,9 @@ type NodeServiceServer interface {
 	RequestNewView(context.Context, *Empty) (*NewView, error)
 	// leader discovery
 	GetLeader(context.Context, *Empty) (*NodeInfo, error)
+	// Bonus: checkpoint distribution
+	SendCheckpoint(context.Context, *Checkpoint) (*Status, error)
+	RequestCheckpoint(context.Context, *CheckpointRequest) (*CheckpointSnapshot, error)
 	mustEmbedUnimplementedNodeServiceServer()
 }
 
@@ -504,6 +532,12 @@ func (UnimplementedNodeServiceServer) RequestNewView(context.Context, *Empty) (*
 }
 func (UnimplementedNodeServiceServer) GetLeader(context.Context, *Empty) (*NodeInfo, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetLeader not implemented")
+}
+func (UnimplementedNodeServiceServer) SendCheckpoint(context.Context, *Checkpoint) (*Status, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method SendCheckpoint not implemented")
+}
+func (UnimplementedNodeServiceServer) RequestCheckpoint(context.Context, *CheckpointRequest) (*CheckpointSnapshot, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method RequestCheckpoint not implemented")
 }
 func (UnimplementedNodeServiceServer) mustEmbedUnimplementedNodeServiceServer() {}
 func (UnimplementedNodeServiceServer) testEmbeddedByValue()                     {}
@@ -688,6 +722,42 @@ func _NodeService_GetLeader_Handler(srv interface{}, ctx context.Context, dec fu
 	return interceptor(ctx, in, info, handler)
 }
 
+func _NodeService_SendCheckpoint_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(Checkpoint)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NodeServiceServer).SendCheckpoint(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: NodeService_SendCheckpoint_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NodeServiceServer).SendCheckpoint(ctx, req.(*Checkpoint))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _NodeService_RequestCheckpoint_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CheckpointRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NodeServiceServer).RequestCheckpoint(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: NodeService_RequestCheckpoint_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NodeServiceServer).RequestCheckpoint(ctx, req.(*CheckpointRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // NodeService_ServiceDesc is the grpc.ServiceDesc for NodeService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -730,6 +800,14 @@ var NodeService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetLeader",
 			Handler:    _NodeService_GetLeader_Handler,
+		},
+		{
+			MethodName: "SendCheckpoint",
+			Handler:    _NodeService_SendCheckpoint_Handler,
+		},
+		{
+			MethodName: "RequestCheckpoint",
+			Handler:    _NodeService_RequestCheckpoint_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

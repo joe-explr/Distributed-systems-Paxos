@@ -34,6 +34,9 @@ message Promise {
     repeated AcceptLogEntry accept_log = 2;
     int32 sender_id = 3;
     int32 executed_seq = 4;
+    // Bonus: latest checkpoint info held by the sender
+    int32 latest_checkpoint_seq = 5;
+    bytes latest_checkpoint_digest = 6;
 }
 
 message PrepareAck {
@@ -76,6 +79,9 @@ message Commit {
 message NewView {
     BallotNumber ballot = 1;
     repeated AcceptLogEntry accept_log = 2;
+    // Bonus: base checkpoint for this view
+    int32 base_checkpoint_seq = 3;
+    bytes base_checkpoint_digest = 4;
 }
 
 message Reply {
@@ -84,6 +90,24 @@ message Reply {
     string client_id = 3;
     bool result = 4;
     string message = 5;
+}
+
+// Bonus: checkpointing messages
+message Checkpoint {
+    int32 seq = 1;                 // highest executed sequence covered
+    bytes digest = 2;              // SHA-256 of state bytes
+    bytes state = 3;               // optional raw snapshot bytes (may be empty)
+}
+
+message CheckpointRequest {
+    int32 seq = 1;
+    bytes digest = 2;
+}
+
+message CheckpointSnapshot {
+    int32 seq = 1;
+    bytes state = 2;
+    bytes digest = 3;              // repeated for verification convenience
 }
 
 // Node information
@@ -111,6 +135,8 @@ message SystemConfig {
 message Status {
     string status = 1;
     string message = 2;
+    // Optional: hint to clients about known leader
+    int32 leader_id = 3;
 }
 
 // Empty message for simple RPC calls
@@ -124,7 +150,7 @@ message PrintStatusRequest {
 // Client-facing service - only what clients need
 service PaxosService {
     // Client to Node communication
-    rpc SendRequest(Request) returns (Reply);
+    rpc SendRequest(Request) returns (Status);
     
     // Utility functions (if clients need them)
     rpc GetStatus(Empty) returns (Status);
@@ -152,6 +178,10 @@ service NodeService {
     
     // leader discovery
     rpc GetLeader(Empty) returns (NodeInfo);
+
+    // Bonus: checkpoint distribution
+    rpc SendCheckpoint(Checkpoint) returns (Status);
+    rpc RequestCheckpoint(CheckpointRequest) returns (CheckpointSnapshot);
 }
 
 // Client service - for nodes to send replies to clients

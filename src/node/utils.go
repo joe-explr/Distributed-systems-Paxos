@@ -213,7 +213,7 @@ func (n *Node) PrintView(ctx context.Context, req *proto.Empty) (*proto.Status, 
 	n.mu.RLock()
 	defer n.mu.RUnlock()
 
-	fmt.Println("=== New-View Messages ===")
+	fmt.Println("=== New-View Messages & Checkpoints ===")
 	if len(n.NewViewLog) == 0 {
 		fmt.Println("No new-view messages received yet")
 	} else {
@@ -221,6 +221,24 @@ func (n *Node) PrintView(ctx context.Context, req *proto.Empty) (*proto.Status, 
 			fmt.Printf("NEW-VIEW #%d:\n", i+1)
 			fmt.Printf("  Ballot: (%d, %d)\n", newView.Ballot.Round, newView.Ballot.NodeId)
 			fmt.Printf("  AcceptLog entries: %d\n", len(newView.AcceptLog))
+			if newView.BaseCheckpointSeq > 0 {
+
+				short := ""
+				if len(newView.BaseCheckpointDigest) > 0 {
+					hexmap := "0123456789abcdef"
+					limit := len(newView.BaseCheckpointDigest)
+					if limit > 4 {
+						limit = 4
+					}
+					for i := 0; i < limit; i++ {
+						b := newView.BaseCheckpointDigest[i]
+
+						fmt.Printf("")
+						short += string(hexmap[b>>4]) + string(hexmap[b&0x0f])
+					}
+				}
+				fmt.Printf("  BaseCheckpoint: seq=%d digest=%s\n", newView.BaseCheckpointSeq, short)
+			}
 			for _, entry := range newView.AcceptLog {
 				if entry.AcceptVal.Transaction.Sender == "no-op" {
 					fmt.Printf("    Seq %d: NO-OP (ballot %d.%d)\n",
@@ -231,6 +249,37 @@ func (n *Node) PrintView(ctx context.Context, req *proto.Empty) (*proto.Status, 
 						entry.AcceptVal.Transaction.Receiver, entry.AcceptVal.Transaction.Amount,
 						entry.AcceptNum.Round, entry.AcceptNum.NodeId)
 				}
+			}
+			fmt.Println()
+		}
+	}
+
+	if n.LastCheckpointSeq > 0 {
+		short := ""
+		if len(n.LastCheckpointDigest) > 0 {
+			hexmap := "0123456789abcdef"
+			limit := len(n.LastCheckpointDigest)
+			if limit > 4 {
+				limit = 4
+			}
+			for i := 0; i < limit; i++ {
+				b := n.LastCheckpointDigest[i]
+				short += string(hexmap[b>>4]) + string(hexmap[b&0x0f])
+			}
+		}
+		fmt.Printf("LocalCheckpoint: seq=%d digest=%s\n", n.LastCheckpointSeq, short)
+	}
+
+	if len(n.CheckpointFetchLog) > 0 {
+		fmt.Println("Checkpoint Fetch Events:")
+		for _, ev := range n.CheckpointFetchLog {
+			result := "ok"
+			if !ev.Success {
+				result = "fail"
+			}
+			fmt.Printf("  seq=%d from=n%d time=%s result=%s", ev.Seq, ev.FromNode, ev.Timestamp.Format("15:04:05.000"), result)
+			if ev.ErrorMsg != "" {
+				fmt.Printf(" err=%s", ev.ErrorMsg)
 			}
 			fmt.Println()
 		}
@@ -371,6 +420,12 @@ func (n *Node) GetExecutedSequence() int32 {
 	n.mu.RLock()
 	defer n.mu.RUnlock()
 	return n.ExecutedSeq
+}
+
+func (n *Node) IsNodeLeader() bool {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.IsLeader
 }
 
 func (n *Node) GetTransactionStatus(sequenceNumber int32) common.TransactionStatus {

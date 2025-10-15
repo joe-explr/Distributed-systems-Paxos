@@ -5,7 +5,7 @@ SBU ID: 116006668
 Notes:
 1. Used LLMs aid for understanding Go code practices, synchronization and deadlock debugging.
 2. Timer 2 strategy is used. 
-3. Checkpointing is not done.
+3. Checkpointing is Done (extra Credits).
 4. The application is run from main.go file 
 5. the terminal interaction implementation and CSV parser was mostly created using LLM generated code.
 6. SQLite3 used for persistent storage.

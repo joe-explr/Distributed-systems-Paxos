@@ -14,6 +14,12 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 )
 
+type queuedRequest struct {
+	request *proto.Request
+	isAsync bool
+	onError func(error) 
+}
+
 type Client struct {
 	ID      string
 	Address string
@@ -29,20 +35,14 @@ type Client struct {
 
 	AsyncTimeout time.Duration
 
-	RequestQueue      []*proto.Request
-	AsyncRequestQueue []*proto.Request
+	RequestQueue []*queuedRequest
 
 	ProcessedRequests map[int64]*proto.Reply
 
-	CurrentRequest      *proto.Request
-	CurrentAsyncRequest *proto.Request
+	CurrentInFlight *queuedRequest
 
-	IsProcessing        bool
-	IsAsyncProcessing   bool
-	ProcessingDone      chan struct{}
-	AsyncProcessingDone chan struct{}
-
-	AsyncErrorCallbacks map[int64]func(error)
+	IsProcessing bool
+	InflightDone chan struct{}
 
 	Logger *common.Logger
 
@@ -55,19 +55,16 @@ type Client struct {
 
 func NewClient(id string, config *common.Config) *Client {
 	client := &Client{
-		ID:                  id,
-		Config:              config,
-		Connections:         make(map[int32]*grpc.ClientConn),
-		CurrentLeaderID:     1,
-		RetryDuration:       3 * time.Second,
-		AsyncTimeout:        7 * time.Second,
-		RequestQueue:        make([]*proto.Request, 0),
-		AsyncRequestQueue:   make([]*proto.Request, 0),
-		ProcessedRequests:   make(map[int64]*proto.Reply),
-		AsyncErrorCallbacks: make(map[int64]func(error)),
-		Logger:              common.NewLogger(),
-		ProcessingDone:      make(chan struct{}, 1),
-		AsyncProcessingDone: make(chan struct{}, 1),
+		ID:                id,
+		Config:            config,
+		Connections:       make(map[int32]*grpc.ClientConn),
+		CurrentLeaderID:   1,
+		RetryDuration:     5 * time.Second,
+		AsyncTimeout:      7 * time.Second,
+		RequestQueue:      make([]*queuedRequest, 0),
+		ProcessedRequests: make(map[int64]*proto.Reply),
+		Logger:            common.NewLogger(),
+		InflightDone:      make(chan struct{}, 1),
 	}
 
 	if err := client.Logger.EnableClientFileLogging(id); err != nil {
@@ -100,7 +97,7 @@ func (c *Client) Start() error {
 }
 
 func (c *Client) Stop() {
-	c.Logger.Log("STOP", "Stopping client", 0)
+	c.Logger.LogClient("STOP", "Stopping client", c.ID)
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -135,16 +132,17 @@ func (c *Client) SendTransaction(sender, receiver string, amount int32) error {
 
 	c.mu.Lock()
 
-	c.RequestQueue = append(c.RequestQueue, request)
+	queued := &queuedRequest{request: request, isAsync: false}
+	c.RequestQueue = append(c.RequestQueue, queued)
 	queueLength := len(c.RequestQueue)
 	shouldStartProcessing := !c.IsProcessing
 	c.mu.Unlock()
 
-	c.Logger.Log("QUEUE", fmt.Sprintf("Added transaction to queue: %s->%s $%d (timestamp: %d, queue length: %d)",
-		sender, receiver, amount, timestamp, queueLength), 0)
+	c.Logger.LogClient("QUEUE", fmt.Sprintf("Added transaction to queue: %s->%s $%d (timestamp: %d, queue length: %d)",
+		sender, receiver, amount, timestamp, queueLength), c.ID)
 
 	if shouldStartProcessing {
-		go c.processRequestQueue()
+		go c.processQueue()
 	}
 
 	return nil
@@ -166,129 +164,91 @@ func (c *Client) SendTransactionAsync(sender, receiver string, amount int32) err
 
 	c.mu.Lock()
 
-	c.AsyncRequestQueue = append(c.AsyncRequestQueue, request)
-	queueLength := len(c.AsyncRequestQueue)
-	shouldStartProcessing := !c.IsAsyncProcessing
-
-	c.AsyncErrorCallbacks[timestamp] = func(err error) {
+	onErr := func(err error) {
 		c.Logger.Log("ERROR", fmt.Sprintf("Async transaction failed: %s->%s $%d - %v",
 			sender, receiver, amount, err), 0)
 	}
+	queued := &queuedRequest{request: request, isAsync: true, onError: onErr}
+	c.RequestQueue = append(c.RequestQueue, queued)
+	queueLength := len(c.RequestQueue)
+	shouldStartProcessing := !c.IsProcessing
 	c.mu.Unlock()
 
-	c.Logger.Log("QUEUE", fmt.Sprintf("Added transaction to async queue: %s->%s $%d (timestamp: %d, queue length: %d)",
-		sender, receiver, amount, timestamp, queueLength), 0)
+	c.Logger.LogClient("QUEUE", fmt.Sprintf("Added transaction to async queue: %s->%s $%d (timestamp: %d, queue length: %d)",
+		sender, receiver, amount, timestamp, queueLength), c.ID)
 
 	if shouldStartProcessing {
-		go c.processRequestQueueAsync()
+		go c.processQueue()
 	}
 
 	return nil
 }
 
-func (c *Client) processRequestQueue() {
+func (c *Client) processQueue() {
 	for {
 		c.mu.Lock()
 
 		if len(c.RequestQueue) == 0 {
 			c.IsProcessing = false
 			c.mu.Unlock()
-			c.Logger.Log("QUEUE", "Request queue empty, stopping processing", 0)
+			c.Logger.LogClient("QUEUE", "Request queue empty, stopping processing", c.ID)
 			return
 		}
 
-		request := c.RequestQueue[0]
+		q := c.RequestQueue[0]
 		c.RequestQueue = c.RequestQueue[1:]
-		c.CurrentRequest = request
+		c.CurrentInFlight = q
 		c.IsProcessing = true
 
-		c.Logger.Log("PROCESS", fmt.Sprintf("Processing request: %s->%s $%d (timestamp: %d, remaining in queue: %d)",
-			request.Transaction.Sender, request.Transaction.Receiver, request.Transaction.Amount,
-			request.Timestamp, len(c.RequestQueue)), 0)
+		if q.isAsync {
+			c.Logger.LogClient("PROCESS", fmt.Sprintf("Processing async request: %s->%s $%d (timestamp: %d, remaining in queue: %d)",
+				q.request.Transaction.Sender, q.request.Transaction.Receiver, q.request.Transaction.Amount,
+				q.request.Timestamp, len(c.RequestQueue)), c.ID)
+		} else {
+			c.Logger.LogClient("PROCESS", fmt.Sprintf("Processing request: %s->%s $%d (timestamp: %d, remaining in queue: %d)",
+				q.request.Transaction.Sender, q.request.Transaction.Receiver, q.request.Transaction.Amount,
+				q.request.Timestamp, len(c.RequestQueue)), c.ID)
+		}
 
 		c.startRetryTimerUnsafe()
 
 		go func(req *proto.Request) {
 			err := c.sendRequestToLeader(req)
 			if err != nil {
-				c.Logger.Log("ERROR", fmt.Sprintf("Failed to send request to leader: %v", err), 0)
+				c.Logger.LogClient("ERROR", fmt.Sprintf("Failed to send request to leader: %v", err), c.ID)
 
 				c.handleRequestTimeout()
 			}
-		}(request)
+		}(q.request)
 
 		c.mu.Unlock()
 
-		<-c.ProcessingDone
-	}
-}
+		if q.isAsync {
+			select {
+			case <-c.InflightDone:
 
-func (c *Client) processRequestQueueAsync() {
-	for {
-		c.mu.Lock()
+				c.Logger.LogClient("PROCESS", fmt.Sprintf("Async request completed: %s->%s $%d",
+					q.request.Transaction.Sender, q.request.Transaction.Receiver, q.request.Transaction.Amount), c.ID)
+			case <-time.After(c.AsyncTimeout):
+				c.Logger.LogClient("TIMEOUT", fmt.Sprintf("Async request timeout after %v: %s->%s $%d",
+					c.AsyncTimeout, q.request.Transaction.Sender, q.request.Transaction.Receiver, q.request.Transaction.Amount), c.ID)
 
-		if len(c.AsyncRequestQueue) == 0 {
-			c.IsAsyncProcessing = false
-			c.mu.Unlock()
-			c.Logger.Log("QUEUE", "Async request queue empty, stopping async processing", 0)
-			return
-		}
+				c.mu.Lock()
 
-		request := c.AsyncRequestQueue[0]
-		c.AsyncRequestQueue = c.AsyncRequestQueue[1:]
-		c.CurrentAsyncRequest = request
-		c.IsAsyncProcessing = true
+				if c.CurrentInFlight == q {
+					c.stopRetryTimerUnsafe()
+					c.CurrentInFlight = nil
+				}
+				c.mu.Unlock()
 
-		c.Logger.Log("PROCESS", fmt.Sprintf("Processing async request: %s->%s $%d (timestamp: %d, remaining in async queue: %d)",
-			request.Transaction.Sender, request.Transaction.Receiver, request.Transaction.Amount,
-			request.Timestamp, len(c.AsyncRequestQueue)), 0)
-
-		c.startRetryTimerUnsafe()
-
-		go func(req *proto.Request) {
-			err := c.sendRequestToLeader(req)
-			if err != nil {
-				c.Logger.Log("ERROR", fmt.Sprintf("Failed to send request to leader: %v", err), 0)
-
-				c.handleRequestTimeout()
+				if q.onError != nil {
+					q.onError(fmt.Errorf("request timeout after %v", c.AsyncTimeout))
+				}
 			}
-		}(request)
-
-		c.mu.Unlock()
-
-		select {
-		case <-c.AsyncProcessingDone:
-
-			c.Logger.Log("PROCESS", fmt.Sprintf("Async request completed: %s->%s $%d",
-				request.Transaction.Sender, request.Transaction.Receiver, request.Transaction.Amount), 0)
-
-			c.cleanupAsyncRequest(request.Timestamp)
-		case <-time.After(c.AsyncTimeout):
-
-			c.Logger.Log("TIMEOUT", fmt.Sprintf("Async request timeout after %v: %s->%s $%d",
-				c.AsyncTimeout, request.Transaction.Sender, request.Transaction.Receiver, request.Transaction.Amount), 0)
-
-			c.mu.Lock()
-			if callback, exists := c.AsyncErrorCallbacks[request.Timestamp]; exists {
-				callback(fmt.Errorf("request timeout after %v", c.AsyncTimeout))
-			}
-			c.CurrentAsyncRequest = nil
-			c.mu.Unlock()
-
-			c.cleanupAsyncRequest(request.Timestamp)
+		} else {
+			<-c.InflightDone
 		}
 	}
-}
-
-func (c *Client) cleanupAsyncRequest(timestamp int64) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	delete(c.AsyncErrorCallbacks, timestamp)
-
-	c.stopRetryTimerUnsafe()
-
-	c.Logger.Log("CLEANUP", fmt.Sprintf("Cleaned up async request resources (timestamp: %d)", timestamp), 0)
 }
 
 func (c *Client) sendRequestToLeader(request *proto.Request) error {
@@ -300,23 +260,39 @@ func (c *Client) sendRequestToLeader(request *proto.Request) error {
 
 	client := proto.NewPaxosServiceClient(conn)
 
-	c.Logger.Log("SEND", fmt.Sprintf("Sending request to leader node %d (timestamp: %d)",
-		c.CurrentLeaderID, request.Timestamp), 0)
+	c.Logger.LogClient("SEND", fmt.Sprintf("Sending request to leader node %d (timestamp: %d)",
+		c.CurrentLeaderID, request.Timestamp), c.ID)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), c.RetryDuration)
 	defer cancel()
 
-	reply, err := client.SendRequest(ctx, request)
+	status, err := client.SendRequest(ctx, request)
 	if err != nil {
 		return fmt.Errorf("leader node %d failed: %v", c.CurrentLeaderID, err)
 	}
 
-	if reply.Message == "Node is down" || reply.Result == false {
-		c.Logger.Log("LEADER_DOWN", fmt.Sprintf("Leader %d responded with failure: %s", c.CurrentLeaderID, reply.Message), 0)
-		return fmt.Errorf("leader node %d is down: %s", c.CurrentLeaderID, reply.Message)
-	}
+	switch status.Status {
+	case "OK_ACCEPTED":
+		if status.LeaderId != 0 {
+			c.CurrentLeaderID = status.LeaderId
+			c.Logger.LogClient("LEADER", fmt.Sprintf("Updated current leader to node %d (from status)", c.CurrentLeaderID), c.ID)
+		}
 
-	return nil
+		return nil
+	case "INACTIVE":
+		return fmt.Errorf("leader node %d is inactive", c.CurrentLeaderID)
+	case "NOT_LEADER":
+		if status.LeaderId != 0 {
+			c.CurrentLeaderID = status.LeaderId
+			c.Logger.LogClient("NOT_LEADER", fmt.Sprintf("Node %d is not leader; hinted leader is %d", c.CurrentLeaderID, status.LeaderId), c.ID)
+		}
+		return nil
+	case "PENDING":
+		c.Logger.LogClient("PENDING", fmt.Sprintf("Leader node %d is pending; leaderId is %d", c.CurrentLeaderID, status.LeaderId), c.ID)
+		return nil
+	default:
+		return fmt.Errorf("unexpected status from leader %d: %s - %s", c.CurrentLeaderID, status.Status, status.Message)
+	}
 }
 
 func (c *Client) startRetryTimerUnsafe() {
@@ -325,36 +301,36 @@ func (c *Client) startRetryTimerUnsafe() {
 		c.RetryTimer.Stop()
 	}
 
-	c.RetryTimer = time.AfterFunc(2*time.Second, func() {
+	c.RetryTimer = time.AfterFunc(c.RetryDuration, func() {
 		c.handleRequestTimeout()
 	})
-	c.Logger.Log("TIMER", "Retry timer started (2s timeout)", 0)
+	c.Logger.LogClient("TIMER", fmt.Sprintf("Retry timer started (%v timeout)", c.RetryDuration), c.ID)
 }
 
 func (c *Client) stopRetryTimerUnsafe() {
 	if c.RetryTimer != nil {
 		c.RetryTimer.Stop()
 		c.RetryTimer = nil
-		c.Logger.Log("TIMER", "Retry timer stopped", 0)
+		c.Logger.LogClient("TIMER", "Retry timer stopped", c.ID)
 	}
 }
 
 func (c *Client) handleRequestTimeout() {
 	c.mu.Lock()
-	currentRequest := c.CurrentRequest
+	current := c.CurrentInFlight
 	oldLeader := c.CurrentLeaderID
 	c.CurrentLeaderID = 0
 	c.mu.Unlock()
 
-	if currentRequest == nil {
-		c.Logger.Log("TIMEOUT", "No current request to retry", 0)
+	if current == nil {
+		c.Logger.LogClient("TIMEOUT", "No current request to retry", c.ID)
 		return
 	}
 
-	c.Logger.Log("TIMEOUT", fmt.Sprintf("Request timeout - leader %d failed, broadcasting to all nodes (timestamp: %d)",
-		oldLeader, currentRequest.Timestamp), 0)
+	c.Logger.LogClient("TIMEOUT", fmt.Sprintf("Request timeout - leader %d failed, broadcasting to all nodes (timestamp: %d)",
+		oldLeader, current.request.Timestamp), c.ID)
 
-	c.broadcastRequestToAllNodes(currentRequest)
+	c.broadcastRequestToAllNodes(current.request)
 
 	c.mu.Lock()
 	c.startRetryTimerUnsafe()
@@ -362,7 +338,7 @@ func (c *Client) handleRequestTimeout() {
 }
 
 func (c *Client) broadcastRequestToAllNodes(request *proto.Request) {
-	c.Logger.Log("BROADCAST", fmt.Sprintf("Broadcasting request to all nodes (timestamp: %d)", request.Timestamp), 0)
+	c.Logger.LogClient("BROADCAST", fmt.Sprintf("Broadcasting request to all nodes (timestamp: %d)", request.Timestamp), c.ID)
 
 	var wg sync.WaitGroup
 	for _, nodeInfo := range c.Config.Nodes {
@@ -371,16 +347,16 @@ func (c *Client) broadcastRequestToAllNodes(request *proto.Request) {
 			defer wg.Done()
 			err := c.sendRequestToNode(request, nodeInfo.ID)
 			if err != nil {
-				c.Logger.Log("ERROR", fmt.Sprintf("Failed to send to node %d: %v", nodeInfo.ID, err), 0)
+				c.Logger.LogClient("ERROR", fmt.Sprintf("Failed to send to node %d: %v", nodeInfo.ID, err), c.ID)
 			} else {
-				c.Logger.Log("BROADCAST", fmt.Sprintf("Successfully sent to node %d", nodeInfo.ID), 0)
+				c.Logger.LogClient("BROADCAST", fmt.Sprintf("Successfully sent to node %d", nodeInfo.ID), c.ID)
 			}
 		}(nodeInfo)
 	}
 
 	go func() {
 		wg.Wait()
-		c.Logger.Log("BROADCAST", "Broadcast to all nodes completed", 0)
+		c.Logger.LogClient("BROADCAST", "Broadcast to all nodes completed", c.ID)
 	}()
 }
 
@@ -391,8 +367,30 @@ func (c *Client) sendRequestToNode(request *proto.Request, nodeID int32) error {
 	}
 
 	client := proto.NewPaxosServiceClient(conn)
-	_, err = client.SendRequest(context.Background(), request)
-	return err
+	status, err := client.SendRequest(context.Background(), request)
+	if err != nil {
+		return err
+	}
+	switch status.Status {
+	case "OK_ACCEPTED":
+
+		if status.LeaderId != 0 {
+			c.mu.Lock()
+			c.CurrentLeaderID = status.LeaderId
+			c.mu.Unlock()
+			c.Logger.LogClient("LEADER", fmt.Sprintf("Adopted leader %d from node %d OK_ACCEPTED", status.LeaderId, nodeID), c.ID)
+		} else {
+			c.mu.Lock()
+			c.CurrentLeaderID = nodeID
+			c.mu.Unlock()
+			c.Logger.LogClient("LEADER", fmt.Sprintf("Adopted node %d as leader (no hint)", nodeID), c.ID)
+		}
+		return nil
+	case "INACTIVE", "NOT_LEADER":
+		return fmt.Errorf("node %d returned %s", nodeID, status.Status)
+	default:
+		return fmt.Errorf("node %d returned unexpected status: %s - %s", nodeID, status.Status, status.Message)
+	}
 }
 
 func (c *Client) SendReply(ctx context.Context, reply *proto.Reply) (*proto.Status, error) {
@@ -407,12 +405,8 @@ func (c *Client) SendReply(ctx context.Context, reply *proto.Reply) (*proto.Stat
 		return &proto.Status{Status: "success", Message: "Duplicate reply ignored"}, nil
 	}
 
-	if c.CurrentRequest != nil && c.CurrentRequest.Timestamp == reply.Timestamp {
-
-		c.processCurrentReplyUnsafe(reply)
-	} else if c.CurrentAsyncRequest != nil && c.CurrentAsyncRequest.Timestamp == reply.Timestamp {
-
-		c.processCurrentAsyncReplyUnsafe(reply)
+	if c.CurrentInFlight != nil && c.CurrentInFlight.request.Timestamp == reply.Timestamp {
+		c.processCurrentReplyUnsafeUnified(reply)
 	} else {
 
 		c.Logger.Log("STALE", fmt.Sprintf("Reply for timestamp %d is not for current request", reply.Timestamp), 0)
@@ -421,49 +415,40 @@ func (c *Client) SendReply(ctx context.Context, reply *proto.Reply) (*proto.Stat
 	return &proto.Status{Status: "success", Message: "Reply processed"}, nil
 }
 
-func (c *Client) processCurrentReplyUnsafe(reply *proto.Reply) {
-	c.Logger.Log("PROCESS", fmt.Sprintf("Processing reply for current request (timestamp: %d)", reply.Timestamp), 0)
+func (c *Client) processCurrentReplyUnsafeUnified(reply *proto.Reply) {
+	if c.CurrentInFlight == nil {
+		return
+	}
+	if c.CurrentInFlight.isAsync {
+		c.Logger.Log("PROCESS", fmt.Sprintf("Processing reply for current async request (timestamp: %d)", reply.Timestamp), 0)
+	} else {
+		c.Logger.Log("PROCESS", fmt.Sprintf("Processing reply for current request (timestamp: %d)", reply.Timestamp), 0)
+	}
 
 	if reply.Ballot != nil {
 		c.CurrentLeaderID = reply.Ballot.NodeId
-		c.Logger.Log("LEADER", fmt.Sprintf("Updated current leader to node %d", c.CurrentLeaderID), 0)
+		if c.CurrentInFlight.isAsync {
+			c.Logger.Log("LEADER", fmt.Sprintf("Updated current leader to node %d (async)", c.CurrentLeaderID), 0)
+		} else {
+			c.Logger.Log("LEADER", fmt.Sprintf("Updated current leader to node %d", c.CurrentLeaderID), 0)
+		}
 	}
 
 	c.stopRetryTimerUnsafe()
 
 	c.ProcessedRequests[reply.Timestamp] = reply
 
-	c.CurrentRequest = nil
+	c.CurrentInFlight = nil
 
-	c.Logger.Log("COMPLETE", fmt.Sprintf("Request completed: %s (Result: %v)", reply.Message, reply.Result), 0)
-
-	select {
-	case c.ProcessingDone <- struct{}{}:
-	default:
-
-	}
-}
-
-func (c *Client) processCurrentAsyncReplyUnsafe(reply *proto.Reply) {
-	c.Logger.Log("PROCESS", fmt.Sprintf("Processing reply for current async request (timestamp: %d)", reply.Timestamp), 0)
-
-	if reply.Ballot != nil {
-		c.CurrentLeaderID = reply.Ballot.NodeId
-		c.Logger.Log("LEADER", fmt.Sprintf("Updated current leader to node %d (async)", c.CurrentLeaderID), 0)
+	if c.CurrentInFlight != nil && c.CurrentInFlight.isAsync {
+		c.Logger.Log("COMPLETE", fmt.Sprintf("Async request completed: %s (Result: %v)", reply.Message, reply.Result), 0)
+	} else {
+		c.Logger.Log("COMPLETE", fmt.Sprintf("Request completed: %s (Result: %v)", reply.Message, reply.Result), 0)
 	}
 
-	c.stopRetryTimerUnsafe()
-
-	c.ProcessedRequests[reply.Timestamp] = reply
-
-	c.CurrentAsyncRequest = nil
-
-	c.Logger.Log("COMPLETE", fmt.Sprintf("Async request completed: %s (Result: %v)", reply.Message, reply.Result), 0)
-
 	select {
-	case c.AsyncProcessingDone <- struct{}{}:
+	case c.InflightDone <- struct{}{}:
 	default:
-
 	}
 }
 

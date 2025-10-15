@@ -2,13 +2,41 @@ package node
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"paxos-banking/proto"
 	"paxos-banking/src/common"
+	"sort"
+	"strconv"
 	"time"
 
 	"google.golang.org/grpc/metadata"
 )
+
+func makeRequestID(req *proto.Request) string {
+	if req == nil || req.ClientId == "" {
+		return ""
+	}
+	return req.ClientId + ":" + strconv.FormatInt(req.Timestamp, 10)
+}
+
+func (n *Node) rememberRequestLocked(req *proto.Request, seq int32) {
+	rid := makeRequestID(req)
+	if rid == "" {
+		return
+	}
+	if n.RequestIDToSeq == nil {
+		n.RequestIDToSeq = make(map[string]int32)
+	}
+	n.RequestIDToSeq[rid] = seq
+
+	if n.LastClientTimestamp == nil {
+		n.LastClientTimestamp = make(map[string]int64)
+	}
+	n.LastClientTimestamp[req.ClientId] = req.Timestamp
+}
 
 func (n *Node) broadcastAccept(accept *proto.Accept) {
 	n.Logger.Log("BROADCAST", fmt.Sprintf("Broadcasting accept for sequence %d", accept.Sequence), n.ID)
@@ -117,13 +145,27 @@ func (n *Node) sendCommitToNode(targetNodeID int32, sequence int32, request *pro
 	if targetNodeID == 0 || targetNodeID == n.ID {
 		return
 	}
+
+	n.mu.Lock()
+	if n.ProposedBallotNumber == nil {
+		n.Logger.Log("ERROR", fmt.Sprintf("Cannot send commit to node %d for sequence %d - ProposedBallotNumber is nil", targetNodeID, sequence), n.ID)
+		n.mu.Unlock()
+		return
+	}
+
+	ballotCopy := &proto.BallotNumber{
+		Round:  n.ProposedBallotNumber.Round,
+		NodeId: n.ProposedBallotNumber.NodeId,
+	}
+	n.mu.Unlock()
+
 	conn, err := n.getConnection(targetNodeID)
 	if err != nil {
 		n.Logger.Log("ERROR", fmt.Sprintf("Failed to connect to node %d for Commit: %v", targetNodeID, err), n.ID)
 		return
 	}
 	client := proto.NewNodeServiceClient(conn)
-	commit := &proto.Commit{Ballot: n.ProposedBallotNumber, Sequence: sequence, Request: request}
+	commit := &proto.Commit{Ballot: ballotCopy, Sequence: sequence, Request: request}
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -154,7 +196,6 @@ func (n *Node) handleLeaderTimeout() {
 	var highestPrepare *proto.Prepare
 	var recentPrepare *proto.Prepare
 
-	// First, look for prepare messages within the tp window (preferred)
 	for _, prepareWithTime := range n.ReceivedPrepares {
 		if now.Sub(prepareWithTime.Timestamp) <= n.PrepareCooldown.tp {
 			if recentPrepare == nil || IsHigherBallot(prepareWithTime.Prepare.Ballot, recentPrepare.Ballot) {
@@ -163,7 +204,6 @@ func (n *Node) handleLeaderTimeout() {
 		}
 	}
 
-	// If no recent prepare messages, look for ANY prepare message (fallback)
 	if recentPrepare == nil {
 		for _, prepareWithTime := range n.ReceivedPrepares {
 			if highestPrepare == nil || IsHigherBallot(prepareWithTime.Prepare.Ballot, highestPrepare.Ballot) {
@@ -172,10 +212,9 @@ func (n *Node) handleLeaderTimeout() {
 		}
 	}
 
-	// Clean up old prepare messages to prevent memory leaks
 	var validPrepares []*PrepareWithTimestamp
 	for _, prepareWithTime := range n.ReceivedPrepares {
-		// Keep prepare messages that are either recent or the highest ballot
+
 		if now.Sub(prepareWithTime.Timestamp) <= n.PrepareCooldown.tp ||
 			(highestPrepare != nil && prepareWithTime.Prepare.Ballot.Round == highestPrepare.Ballot.Round &&
 				prepareWithTime.Prepare.Ballot.NodeId == highestPrepare.Ballot.NodeId) {
@@ -185,13 +224,28 @@ func (n *Node) handleLeaderTimeout() {
 	n.ReceivedPrepares = validPrepares
 	n.mu.Unlock()
 
-	// Process recent prepare message if available, otherwise process any prepare message
 	if recentPrepare != nil {
+		if n.NewViewReceived != nil {
+			key := fmt.Sprintf("%d.%d", recentPrepare.Ballot.Round, recentPrepare.Ballot.NodeId)
+			if n.NewViewReceived[key] {
+				n.Logger.Log("TIMEOUT", fmt.Sprintf("Skipping queued prepare %s - NEW-VIEW already received", key), n.ID)
+				n.initiateLeaderElection()
+				return
+			}
+		}
 		n.Logger.Log("TIMEOUT", fmt.Sprintf("Found prepare message %d.%d in last tp time, sending ACK",
 			recentPrepare.Ballot.Round, recentPrepare.Ballot.NodeId), n.ID)
 		n.processPrepareMessageDirectly(recentPrepare)
 		return
 	} else if highestPrepare != nil {
+		if n.NewViewReceived != nil {
+			key := fmt.Sprintf("%d.%d", highestPrepare.Ballot.Round, highestPrepare.Ballot.NodeId)
+			if n.NewViewReceived[key] {
+				n.Logger.Log("TIMEOUT", fmt.Sprintf("Skipping highest queued prepare %s - NEW-VIEW already received", key), n.ID)
+				n.initiateLeaderElection()
+				return
+			}
+		}
 		n.Logger.Log("TIMEOUT", fmt.Sprintf("Found older prepare message %d.%d (outside tp window), processing anyway to prevent election deadlock",
 			highestPrepare.Ballot.Round, highestPrepare.Ballot.NodeId), n.ID)
 		n.processPrepareMessageDirectly(highestPrepare)
@@ -336,7 +390,7 @@ func (n *Node) handleTransactionFailure(sequenceNumber int32, request *proto.Req
 func (n *Node) checkAndRetryWaitingTransactions() {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-
+	n.Logger.Log("RETRY", fmt.Sprintf("Retrying execution of transactions from sequence %d to %d", n.ExecutedSeq+1, n.CommittedSeq), n.ID)
 	for seq := n.ExecutedSeq + 1; seq <= n.CommittedSeq; seq++ {
 		if !n.ExecutedTransactions[seq] {
 			if request, exists := n.AcceptedTransactions[seq]; exists {
@@ -361,6 +415,11 @@ func (n *Node) checkAndRetryWaitingTransactions() {
 func (n *Node) executeTransaction(sequenceNumber int32, request *proto.Request) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+
+	if sequenceNumber <= n.ExecutedSeq {
+		n.Logger.Log("EXECUTE", fmt.Sprintf("Skipping already executed/ checkpointed seq %d (executed=%d)", sequenceNumber, n.ExecutedSeq), n.ID)
+		return
+	}
 
 	if n.ExecutedTransactions[sequenceNumber] {
 		n.Logger.Log("EXECUTE", fmt.Sprintf("Transaction %d already executed", sequenceNumber), n.ID)
@@ -441,6 +500,13 @@ func (n *Node) executeTransaction(sequenceNumber int32, request *proto.Request) 
 	go n.resetTimerOnExecution()
 
 	go n.checkAndRetryWaitingTransactions()
+
+	isLeader := n.IsLeader
+	seqNow := n.ExecutedSeq
+	period := n.CheckpointPeriod
+	if isLeader && period > 0 && seqNow > 0 && seqNow%period == 0 {
+		go n.emitCheckpoint(seqNow)
+	}
 }
 
 func (n *Node) isWaitingToExecute() bool {
@@ -538,9 +604,50 @@ func (n *Node) restartTimerIfNeeded() {
 	timer.Stop()
 }
 
+func (n *Node) startTimerIfNotRunning() {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	if !n.IsActive || n.IsLeader {
+		return
+	}
+
+	hasPendingWork := len(n.PendingRequests) > 0
+
+	if !hasPendingWork {
+
+		hasPendingWork = n.ExecutedSeq < n.CommittedSeq
+	}
+
+	if !hasPendingWork {
+		return
+	}
+
+	if n.LeaderTimer != nil && !n.LeaderTimer.IsRunning() {
+		n.Logger.Log("TIMER", "Starting election timer - have pending work", n.ID)
+		n.LeaderTimer.Start()
+	} else if n.LeaderTimer == nil {
+
+		minTimeout := 700 * time.Millisecond
+		maxTimeout := 2000 * time.Millisecond
+		timer := common.NewRandomizedTimerWithLogging(minTimeout, maxTimeout, n.handleLeaderTimeout, n.Logger, n.ID)
+		n.LeaderTimer = timer
+		timer.Start()
+		n.Logger.Log("TIMER", fmt.Sprintf("Created and started timer with range %v - %v", minTimeout, maxTimeout), n.ID)
+	}
+}
+
 func (n *Node) processPrepareMessageDirectly(prepare *proto.Prepare) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+
+	if n.NewViewReceived != nil {
+		key := fmt.Sprintf("%d.%d", prepare.Ballot.Round, prepare.Ballot.NodeId)
+		if n.NewViewReceived[key] {
+			n.Logger.Log("PREPARE", fmt.Sprintf("Ignoring prepare %s - NEW-VIEW already received", key), n.ID)
+			return
+		}
+	}
 
 	n.Logger.Log("PREPARE", fmt.Sprintf("Processing prepare message %d.%d directly",
 		prepare.Ballot.Round, prepare.Ballot.NodeId), n.ID)
@@ -594,10 +701,12 @@ func (n *Node) sendPromiseToProposer(prepare *proto.Prepare) {
 		prepare.Ballot.Round, prepare.Ballot.NodeId), n.ID)
 
 	promise := &proto.Promise{
-		Ballot:      prepare.Ballot,
-		AcceptLog:   n.AcceptLog,
-		SenderId:    n.ID,
-		ExecutedSeq: n.ExecutedSeq,
+		Ballot:                 prepare.Ballot,
+		AcceptLog:              n.AcceptLog,
+		SenderId:               n.ID,
+		ExecutedSeq:            n.ExecutedSeq,
+		LatestCheckpointSeq:    n.LastCheckpointSeq,
+		LatestCheckpointDigest: n.LastCheckpointDigest,
 	}
 
 	conn, err := n.getConnection(prepare.Ballot.NodeId)
@@ -621,6 +730,29 @@ func (n *Node) sendPromiseToProposer(prepare *proto.Prepare) {
 
 func (n *Node) updateTransactionStatusLocked(sequenceNumber int32, request *proto.Request, status common.TransactionStatus, ballotNumber *proto.BallotNumber) {
 
+	if prev, exists := n.TransactionStatus[sequenceNumber]; exists {
+		if status > prev.Status {
+
+			transactionInfo := &common.TransactionInfo{
+				SequenceNumber: sequenceNumber,
+				Request:        request,
+				Status:         status,
+				BallotNumber:   ballotNumber,
+				NodeID:         n.ID,
+				Timestamp:      time.Now(),
+			}
+			n.TransactionStatus[sequenceNumber] = transactionInfo
+			n.Logger.Log("STATUS", fmt.Sprintf("Updated transaction %d status to %s", sequenceNumber, status.String()), n.ID)
+		} else {
+
+			prev.BallotNumber = ballotNumber
+			prev.Request = request
+			prev.Timestamp = time.Now()
+			n.Logger.Log("STATUS", fmt.Sprintf("Preserved transaction %d status %s (incoming %s)", sequenceNumber, prev.Status.String(), status.String()), n.ID)
+		}
+		return
+	}
+
 	transactionInfo := &common.TransactionInfo{
 		SequenceNumber: sequenceNumber,
 		Request:        request,
@@ -629,31 +761,12 @@ func (n *Node) updateTransactionStatusLocked(sequenceNumber int32, request *prot
 		NodeID:         n.ID,
 		Timestamp:      time.Now(),
 	}
-	n.TransactionStatus[sequenceNumber] = transactionInfo
-	n.Logger.Log("STATUS", fmt.Sprintf("Updated transaction %d status to %s", sequenceNumber, status.String()), n.ID)
-}
-
-func (n *Node) updateTransactionStatus(sequenceNumber int32, request *proto.Request, status common.TransactionStatus, ballotNumber *proto.BallotNumber) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-
-	transactionInfo := &common.TransactionInfo{
-		SequenceNumber: sequenceNumber,
-		Request:        request,
-		Status:         status,
-		BallotNumber:   ballotNumber,
-		NodeID:         n.ID,
-		Timestamp:      time.Now(),
-	}
-
 	n.TransactionStatus[sequenceNumber] = transactionInfo
 	n.Logger.Log("STATUS", fmt.Sprintf("Updated transaction %d status to %s", sequenceNumber, status.String()), n.ID)
 }
 
 func (n *Node) broadcastPrepare(prepare *proto.Prepare) {
 	n.Logger.Log("BROADCAST", "Broadcasting prepare message", n.ID)
-
-	n.PrepareCooldown.notePrepareSeen(time.Now())
 
 	for _, nodeInfo := range n.Config.Nodes {
 		if nodeInfo.ID == n.ID {
@@ -734,6 +847,11 @@ func (n *Node) processPromiseMessage(senderId int32, promise *proto.Promise) {
 		n.minExecutedSeqFromPromises = promise.ExecutedSeq
 	}
 
+	if promise.LatestCheckpointSeq > n.promiseMaxCheckpointSeq {
+		n.promiseMaxCheckpointSeq = promise.LatestCheckpointSeq
+		n.promiseMaxCheckpointDigest = promise.LatestCheckpointDigest
+	}
+
 	for _, entry := range promise.AcceptLog {
 		seq := entry.AcceptSeq
 		if existing, ok := n.PromiseAcceptLog[seq]; ok {
@@ -798,11 +916,25 @@ func (n *Node) processPendingRequests() {
 func (n *Node) createNewViewMessage() {
 	n.Logger.Log("NEWVIEW", "Creating NEW-VIEW message", n.ID)
 
-	acceptLog := n.aggregateAcceptLogFromPromises()
+	n.mu.Lock()
+	if n.ProposedBallotNumber == nil {
+		n.Logger.Log("NEWVIEW", "Aborting NEW-VIEW creation - candidacy was abandoned (ProposedBallotNumber is nil)", n.ID)
+		n.mu.Unlock()
+		return
+	}
+
+	ballotCopy := &proto.BallotNumber{
+		Round:  n.ProposedBallotNumber.Round,
+		NodeId: n.ProposedBallotNumber.NodeId,
+	}
+	checkpointSeq := n.promiseMaxCheckpointSeq
+	checkpointDigest := n.promiseMaxCheckpointDigest
+	n.mu.Unlock()
+
+	acceptLog := n.aggregateAcceptLogFromPromises(ballotCopy)
 
 	n.mu.Lock()
 	for _, e := range acceptLog {
-
 		n.AcceptedTransactions[e.AcceptSeq] = e.AcceptVal
 
 		if n.AcceptedBy[e.AcceptSeq] == nil {
@@ -810,13 +942,15 @@ func (n *Node) createNewViewMessage() {
 		}
 		n.AcceptedBy[e.AcceptSeq][n.ID] = true
 
-		n.updateTransactionStatusLocked(e.AcceptSeq, e.AcceptVal, common.Accepted, n.ProposedBallotNumber)
+		n.updateTransactionStatusLocked(e.AcceptSeq, e.AcceptVal, common.Accepted, ballotCopy)
 	}
 	n.mu.Unlock()
 
 	newView := &proto.NewView{
-		Ballot:    n.ProposedBallotNumber,
-		AcceptLog: acceptLog,
+		Ballot:               ballotCopy,
+		AcceptLog:            acceptLog,
+		BaseCheckpointSeq:    checkpointSeq,
+		BaseCheckpointDigest: checkpointDigest,
 	}
 
 	n.mu.Lock()
@@ -864,7 +998,7 @@ func (n *Node) createNewViewMessage() {
 	}()
 }
 
-func (n *Node) aggregateAcceptLogFromPromises() []*proto.AcceptLogEntry {
+func (n *Node) aggregateAcceptLogFromPromises(ballot *proto.BallotNumber) []*proto.AcceptLogEntry {
 	n.mu.RLock()
 	defer n.mu.RUnlock()
 
@@ -885,14 +1019,14 @@ func (n *Node) aggregateAcceptLogFromPromises() []*proto.AcceptLogEntry {
 		if entry, ok := n.PromiseAcceptLog[seq]; ok {
 
 			aggregated = append(aggregated, &proto.AcceptLogEntry{
-				AcceptNum: n.ProposedBallotNumber,
+				AcceptNum: ballot,
 				AcceptSeq: seq,
 				AcceptVal: entry.AcceptVal,
 			})
 		} else {
 
 			aggregated = append(aggregated, &proto.AcceptLogEntry{
-				AcceptNum: n.ProposedBallotNumber,
+				AcceptNum: ballot,
 				AcceptSeq: seq,
 				AcceptVal: &proto.Request{ClientId: "no-op", Timestamp: time.Now().UnixNano(), Transaction: &proto.Transaction{Sender: "no-op", Receiver: "no-op", Amount: 0}},
 			})
@@ -939,8 +1073,29 @@ func (n *Node) broadcastNewView(newView *proto.NewView) {
 func (n *Node) broadcastCommit(sequence int32, request *proto.Request) {
 	n.Logger.Log("BROADCAST", fmt.Sprintf("Broadcasting commit for sequence %d", sequence), n.ID)
 
+	n.mu.Lock()
+	if transactionInfo, exists := n.TransactionStatus[sequence]; exists {
+		if transactionInfo.Status != common.Executed {
+			n.updateTransactionStatusLocked(sequence, request, common.Committed, n.ProposedBallotNumber)
+		}
+	}
+
+	n.AcceptedTransactions[sequence] = request
+
+	if n.ProposedBallotNumber == nil {
+		n.Logger.Log("ERROR", fmt.Sprintf("Cannot broadcast commit for sequence %d - ProposedBallotNumber is nil", sequence), n.ID)
+		n.mu.Unlock()
+		return
+	}
+
+	ballotCopy := &proto.BallotNumber{
+		Round:  n.ProposedBallotNumber.Round,
+		NodeId: n.ProposedBallotNumber.NodeId,
+	}
+	n.mu.Unlock()
+
 	commit := &proto.Commit{
-		Ballot:   n.ProposedBallotNumber,
+		Ballot:   ballotCopy,
 		Sequence: sequence,
 		Request:  request,
 	}
@@ -973,6 +1128,240 @@ func (n *Node) broadcastCommit(sequence int32, request *proto.Request) {
 
 	go n.executeTransaction(sequence, request)
 
+}
+
+type accountKV struct {
+	ClientID string `json:"client_id"`
+	Balance  int32  `json:"balance"`
+}
+
+type clientTsKV struct {
+	ClientID string `json:"client_id"`
+	Ts       int64  `json:"ts"`
+}
+
+type snapshotData struct {
+	ExecutedSeq      int32        `json:"executed_seq"`
+	CommittedSeq     int32        `json:"committed_seq"`
+	Accounts         []accountKV  `json:"accounts"`
+	ClientTimestamps []clientTsKV `json:"client_timestamps"`
+}
+
+func (n *Node) serializeSnapshotLocked() ([]byte, []byte, error) {
+
+	var accs []accountKV
+	for id, acc := range n.Accounts {
+		accs = append(accs, accountKV{ClientID: id, Balance: acc.GetBalance()})
+	}
+	sort.Slice(accs, func(i, j int) bool { return accs[i].ClientID < accs[j].ClientID })
+
+	var tsList []clientTsKV
+	for id, ts := range n.LastClientTimestamp {
+		tsList = append(tsList, clientTsKV{ClientID: id, Ts: ts})
+	}
+	sort.Slice(tsList, func(i, j int) bool { return tsList[i].ClientID < tsList[j].ClientID })
+
+	snap := snapshotData{
+		ExecutedSeq:      n.ExecutedSeq,
+		CommittedSeq:     n.CommittedSeq,
+		Accounts:         accs,
+		ClientTimestamps: tsList,
+	}
+	bytes, err := json.Marshal(snap)
+	if err != nil {
+		return nil, nil, err
+	}
+	sum := sha256.Sum256(bytes)
+	digest := sum[:]
+	return bytes, digest, nil
+}
+
+func (n *Node) deserializeSnapshot(bytes []byte) (*snapshotData, error) {
+	var snap snapshotData
+	if err := json.Unmarshal(bytes, &snap); err != nil {
+		return nil, err
+	}
+	return &snap, nil
+}
+
+func (n *Node) installCheckpointStateLocked(seq int32, state []byte, digest []byte) error {
+
+	sum := sha256.Sum256(state)
+	if digest != nil && hex.EncodeToString(sum[:]) != hex.EncodeToString(digest) {
+		return fmt.Errorf("checkpoint digest mismatch")
+	}
+	snap, err := n.deserializeSnapshot(state)
+	if err != nil {
+		return err
+	}
+
+	for _, kv := range snap.Accounts {
+		if acct, ok := n.Accounts[kv.ClientID]; ok {
+			acct.UpdateBalance(kv.Balance - acct.GetBalance())
+		} else {
+			n.Accounts[kv.ClientID] = &common.Account{ClientID: kv.ClientID, Balance: kv.Balance}
+		}
+		if n.DB != nil {
+			_ = n.DB.UpdateAccount(kv.ClientID, kv.Balance)
+		}
+	}
+
+	n.LastClientTimestamp = make(map[string]int64)
+	for _, kv := range snap.ClientTimestamps {
+		n.LastClientTimestamp[kv.ClientID] = kv.Ts
+	}
+
+	if snap.ExecutedSeq > n.ExecutedSeq {
+		n.ExecutedSeq = snap.ExecutedSeq
+	}
+	if snap.CommittedSeq > n.CommittedSeq {
+		n.CommittedSeq = snap.CommittedSeq
+	}
+	n.LastCheckpointSeq = seq
+	n.LastCheckpointState = state
+	n.LastCheckpointDigest = digest
+
+	n.pruneLogsUpToLocked(seq)
+	if n.DB != nil {
+		_ = n.DB.SaveSystemState(n.ID, n.SequenceNum, n.ExecutedSeq, n.CommittedSeq)
+	}
+	return nil
+}
+
+func (n *Node) pruneLogsUpToLocked(seq int32) {
+
+	var kept []*proto.AcceptLogEntry
+	for _, e := range n.AcceptLog {
+		if e.AcceptSeq > seq {
+			kept = append(kept, e)
+		}
+	}
+	n.AcceptLog = kept
+
+	for s := range n.AcceptedTransactions {
+		if s <= seq {
+			delete(n.AcceptedTransactions, s)
+		}
+	}
+	for s := range n.ExecutedTransactions {
+		if s < seq {
+			delete(n.ExecutedTransactions, s)
+		}
+	}
+	for s := range n.TransactionStatus {
+		if s <= seq {
+			delete(n.TransactionStatus, s)
+		}
+	}
+	for s := range n.CommittedSet {
+		if s <= seq {
+			delete(n.CommittedSet, s)
+		}
+	}
+	for s := range n.CommitSent {
+		if s <= seq {
+			delete(n.CommitSent, s)
+		}
+	}
+	for s := range n.AcceptedBy {
+		if s <= seq {
+			delete(n.AcceptedBy, s)
+		}
+	}
+}
+
+func (n *Node) emitCheckpoint(seq int32) {
+	n.mu.Lock()
+	state, digest, err := n.serializeSnapshotLocked()
+	if err != nil {
+		n.Logger.Log("ERROR", fmt.Sprintf("Failed to serialize checkpoint: %v", err), n.ID)
+		n.mu.Unlock()
+		return
+	}
+	n.LastCheckpointSeq = seq
+	n.LastCheckpointDigest = digest
+	n.LastCheckpointState = state
+	n.mu.Unlock()
+
+	ckpt := &proto.Checkpoint{Seq: seq, Digest: digest, State: state}
+	n.broadcastCheckpoint(ckpt)
+}
+
+func (n *Node) broadcastCheckpoint(ckpt *proto.Checkpoint) {
+	n.Logger.Log("BROADCAST", fmt.Sprintf("Broadcasting checkpoint seq=%d", ckpt.Seq), n.ID)
+	for _, nodeInfo := range n.Config.Nodes {
+		if nodeInfo.ID == n.ID {
+			continue
+		}
+		go func(nodeInfo common.NodeInfo) {
+			conn, err := n.getConnection(nodeInfo.ID)
+			if err != nil {
+				n.Logger.Log("ERROR", fmt.Sprintf("Failed to connect to node %d for checkpoint: %v", nodeInfo.ID, err), n.ID)
+				return
+			}
+			client := proto.NewNodeServiceClient(conn)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if _, err := client.SendCheckpoint(ctx, ckpt); err != nil {
+				n.Logger.Log("ERROR", fmt.Sprintf("Failed to send checkpoint to node %d: %v", nodeInfo.ID, err), n.ID)
+			}
+		}(nodeInfo)
+	}
+}
+
+func (n *Node) ensureCheckpointInstalled(seq int32, digest []byte, leaderID int32) {
+	sources := n.selectCheckpointSources(leaderID)
+	for _, src := range sources {
+		if src == n.ID {
+			continue
+		}
+		if n.tryFetchAndInstallCheckpoint(src, seq, digest) {
+			n.mu.Lock()
+			n.CheckpointFetchLog = append(n.CheckpointFetchLog, CheckpointFetchEvent{Seq: seq, FromNode: src, Success: true, ErrorMsg: "", Timestamp: time.Now()})
+			n.mu.Unlock()
+			n.Logger.Log("CHECKPOINT", fmt.Sprintf("Installed checkpoint %d from node %d", seq, src), n.ID)
+			return
+		}
+		n.mu.Lock()
+		n.CheckpointFetchLog = append(n.CheckpointFetchLog, CheckpointFetchEvent{Seq: seq, FromNode: src, Success: false, ErrorMsg: "fetch_or_verify_failed", Timestamp: time.Now()})
+		n.mu.Unlock()
+	}
+	n.Logger.Log("ERROR", fmt.Sprintf("Failed to install checkpoint %d from any peer", seq), n.ID)
+}
+
+func (n *Node) selectCheckpointSources(leaderID int32) []int32 {
+
+	active := n.listActivePeerIDs()
+	sort.Slice(active, func(i, j int) bool { return active[i] < active[j] })
+	var sources []int32
+	if leaderID > 0 {
+		sources = append(sources, leaderID)
+	}
+	for _, id := range active {
+		if id != leaderID {
+			sources = append(sources, id)
+		}
+	}
+	return sources
+}
+
+func (n *Node) tryFetchAndInstallCheckpoint(src int32, seq int32, digest []byte) bool {
+	conn, err := n.getConnection(src)
+	if err != nil {
+		return false
+	}
+	client := proto.NewNodeServiceClient(conn)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	snap, err := client.RequestCheckpoint(ctx, &proto.CheckpointRequest{Seq: seq, Digest: digest})
+	if err != nil || snap == nil || len(snap.State) == 0 {
+		return false
+	}
+
+	n.mu.Lock()
+	err = n.installCheckpointStateLocked(seq, snap.State, snap.Digest)
+	n.mu.Unlock()
+	return err == nil
 }
 
 func (n *Node) sendReplyToClient(originalRequest *proto.Request, success bool, message string, transaction *proto.Transaction, senderBalance, receiverBalance int32) {
@@ -1100,9 +1489,8 @@ func (n *Node) simpleRecovery() {
 		shouldStart := n.isWaitingToExecute()
 
 		if timer == nil {
-
 			n.restartTimerIfNeeded()
-		} else if timer != nil && shouldStart && isActive && !isLeader {
+		} else if shouldStart && isActive && !isLeader {
 
 			if n.IsNodeActive() {
 				n.Logger.Log("TIMER", "Ensuring election timer is active after recovery failure", n.ID)
@@ -1201,32 +1589,6 @@ func (n *Node) listActivePeerIDs() []int32 {
 		}
 	}
 	return active
-}
-
-func (n *Node) queryNodeForLeaderWithTimeout(nodeID int32, timeout time.Duration) int32 {
-	conn, err := n.getConnection(nodeID)
-	if err != nil {
-		n.Logger.Log("ERROR", fmt.Sprintf("Failed to connect to node %d for leader discovery: %v", nodeID, err), n.ID)
-		return 0
-	}
-
-	client := proto.NewNodeServiceClient(conn)
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	leaderInfo, err := client.GetLeader(ctx, &proto.Empty{})
-	if err != nil {
-		n.Logger.Log("ERROR", fmt.Sprintf("Failed to get leader from node %d: %v", nodeID, err), n.ID)
-		return 0
-	}
-
-	if leaderInfo.NodeId > 0 {
-		n.Logger.Log("RECOVERY", fmt.Sprintf("Node %d reports leader %d", nodeID, leaderInfo.NodeId), n.ID)
-		return leaderInfo.NodeId
-	}
-
-	n.Logger.Log("RECOVERY", fmt.Sprintf("Node %d reports no leader", nodeID), n.ID)
-	return 0
 }
 
 func (n *Node) queryNodeForLeaderWithContext(ctx context.Context, nodeID int32) int32 {
