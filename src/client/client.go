@@ -17,7 +17,7 @@ import (
 type queuedRequest struct {
 	request *proto.Request
 	isAsync bool
-	onError func(error) 
+	onError func(error)
 }
 
 type Client struct {
@@ -32,6 +32,8 @@ type Client struct {
 
 	RetryTimer    *time.Timer
 	RetryDuration time.Duration
+	MaxRetryCount int
+	RetryForever  bool
 
 	AsyncTimeout time.Duration
 
@@ -48,35 +50,61 @@ type Client struct {
 
 	Server *grpc.Server
 
+	currentRetryCount int
+
 	mu sync.Mutex
 
 	proto.UnimplementedClientServiceServer
 }
 
 func NewClient(id string, config *common.Config) *Client {
+	retryDuration := 5 * time.Second
+	asyncTimeout := 30 * time.Second
+	maxRetries := 0
+	retryForever := true
+
+	if config != nil {
+		retryDuration = time.Duration(config.Timers.Client.RetryIntervalMs) * time.Millisecond
+		if retryDuration <= 0 {
+			retryDuration = 5 * time.Second
+		}
+		asyncTimeout = time.Duration(config.Timers.Client.AsyncTimeoutMs) * time.Millisecond
+		if asyncTimeout <= 0 {
+			asyncTimeout = 30 * time.Second
+		}
+		maxRetries = config.Timers.Client.MaxRetries
+		if maxRetries < 0 {
+			maxRetries = 0
+		}
+		retryForever = config.Timers.Client.RetryForever
+	}
+
 	client := &Client{
 		ID:                id,
 		Config:            config,
 		Connections:       make(map[int32]*grpc.ClientConn),
 		CurrentLeaderID:   1,
-		RetryDuration:     5 * time.Second,
-		AsyncTimeout:      7 * time.Second,
+		RetryDuration:     retryDuration,
+		MaxRetryCount:     maxRetries,
+		RetryForever:      retryForever,
+		AsyncTimeout:      asyncTimeout,
 		RequestQueue:      make([]*queuedRequest, 0),
 		ProcessedRequests: make(map[int64]*proto.Reply),
 		Logger:            common.NewLogger(),
 		InflightDone:      make(chan struct{}, 1),
+		currentRetryCount: 0,
 	}
 
 	if err := client.Logger.EnableClientFileLogging(id); err != nil {
 		fmt.Printf("Warning: Failed to enable file logging for client %s: %v\n", id, err)
 	}
 
-	client.Logger.LogClient("INIT", fmt.Sprintf("Client %s initialized", id), id)
+	client.Logger.LogClientWithWallTime("INIT", fmt.Sprintf("Client %s initialized", id), id)
 	return client
 }
 
 func (c *Client) Start() error {
-	c.Logger.LogClient("START", fmt.Sprintf("Starting client %s on port %d", c.ID, c.Port), c.ID)
+	c.Logger.LogClientWithWallTime("START", fmt.Sprintf("Starting client %s on port %d", c.ID, c.Port), c.ID)
 
 	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", c.Port))
 	if err != nil {
@@ -92,12 +120,12 @@ func (c *Client) Start() error {
 		}
 	}()
 
-	c.Logger.LogClient("START", "Client server started successfully", c.ID)
+	c.Logger.LogClientWithWallTime("START", "Client server started successfully", c.ID)
 	return nil
 }
 
 func (c *Client) Stop() {
-	c.Logger.LogClient("STOP", "Stopping client", c.ID)
+	c.Logger.LogClientWithWallTime("STOP", "Stopping client", c.ID)
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -138,7 +166,7 @@ func (c *Client) SendTransaction(sender, receiver string, amount int32) error {
 	shouldStartProcessing := !c.IsProcessing
 	c.mu.Unlock()
 
-	c.Logger.LogClient("QUEUE", fmt.Sprintf("Added transaction to queue: %s->%s $%d (timestamp: %d, queue length: %d)",
+	c.Logger.LogClientWithWallTime("QUEUE", fmt.Sprintf("Added transaction to queue: %s->%s $%d (timestamp: %d, queue length: %d)",
 		sender, receiver, amount, timestamp, queueLength), c.ID)
 
 	if shouldStartProcessing {
@@ -165,7 +193,7 @@ func (c *Client) SendTransactionAsync(sender, receiver string, amount int32) err
 	c.mu.Lock()
 
 	onErr := func(err error) {
-		c.Logger.Log("ERROR", fmt.Sprintf("Async transaction failed: %s->%s $%d - %v",
+		c.Logger.LogWithWallTime("ERROR", fmt.Sprintf("Async transaction failed: %s->%s $%d - %v",
 			sender, receiver, amount, err), 0)
 	}
 	queued := &queuedRequest{request: request, isAsync: true, onError: onErr}
@@ -174,7 +202,7 @@ func (c *Client) SendTransactionAsync(sender, receiver string, amount int32) err
 	shouldStartProcessing := !c.IsProcessing
 	c.mu.Unlock()
 
-	c.Logger.LogClient("QUEUE", fmt.Sprintf("Added transaction to async queue: %s->%s $%d (timestamp: %d, queue length: %d)",
+	c.Logger.LogClientWithWallTime("QUEUE", fmt.Sprintf("Added transaction to async queue: %s->%s $%d (timestamp: %d, queue length: %d)",
 		sender, receiver, amount, timestamp, queueLength), c.ID)
 
 	if shouldStartProcessing {
@@ -191,7 +219,7 @@ func (c *Client) processQueue() {
 		if len(c.RequestQueue) == 0 {
 			c.IsProcessing = false
 			c.mu.Unlock()
-			c.Logger.LogClient("QUEUE", "Request queue empty, stopping processing", c.ID)
+			c.Logger.LogClientWithWallTime("QUEUE", "Request queue empty, stopping processing", c.ID)
 			return
 		}
 
@@ -201,11 +229,11 @@ func (c *Client) processQueue() {
 		c.IsProcessing = true
 
 		if q.isAsync {
-			c.Logger.LogClient("PROCESS", fmt.Sprintf("Processing async request: %s->%s $%d (timestamp: %d, remaining in queue: %d)",
+			c.Logger.LogClientWithWallTime("PROCESS", fmt.Sprintf("Processing async request: %s->%s $%d (timestamp: %d, remaining in queue: %d)",
 				q.request.Transaction.Sender, q.request.Transaction.Receiver, q.request.Transaction.Amount,
 				q.request.Timestamp, len(c.RequestQueue)), c.ID)
 		} else {
-			c.Logger.LogClient("PROCESS", fmt.Sprintf("Processing request: %s->%s $%d (timestamp: %d, remaining in queue: %d)",
+			c.Logger.LogClientWithWallTime("PROCESS", fmt.Sprintf("Processing request: %s->%s $%d (timestamp: %d, remaining in queue: %d)",
 				q.request.Transaction.Sender, q.request.Transaction.Receiver, q.request.Transaction.Amount,
 				q.request.Timestamp, len(c.RequestQueue)), c.ID)
 		}
@@ -215,7 +243,7 @@ func (c *Client) processQueue() {
 		go func(req *proto.Request) {
 			err := c.sendRequestToLeader(req)
 			if err != nil {
-				c.Logger.LogClient("ERROR", fmt.Sprintf("Failed to send request to leader: %v", err), c.ID)
+				c.Logger.LogClientWithWallTime("ERROR", fmt.Sprintf("Failed to send request to leader: %v", err), c.ID)
 
 				c.handleRequestTimeout()
 			}
@@ -227,10 +255,10 @@ func (c *Client) processQueue() {
 			select {
 			case <-c.InflightDone:
 
-				c.Logger.LogClient("PROCESS", fmt.Sprintf("Async request completed: %s->%s $%d",
+				c.Logger.LogClientWithWallTime("PROCESS", fmt.Sprintf("Async request completed: %s->%s $%d",
 					q.request.Transaction.Sender, q.request.Transaction.Receiver, q.request.Transaction.Amount), c.ID)
 			case <-time.After(c.AsyncTimeout):
-				c.Logger.LogClient("TIMEOUT", fmt.Sprintf("Async request timeout after %v: %s->%s $%d",
+				c.Logger.LogClientWithWallTime("TIMEOUT", fmt.Sprintf("Async request timeout after %v: %s->%s $%d",
 					c.AsyncTimeout, q.request.Transaction.Sender, q.request.Transaction.Receiver, q.request.Transaction.Amount), c.ID)
 
 				c.mu.Lock()
@@ -260,7 +288,7 @@ func (c *Client) sendRequestToLeader(request *proto.Request) error {
 
 	client := proto.NewPaxosServiceClient(conn)
 
-	c.Logger.LogClient("SEND", fmt.Sprintf("Sending request to leader node %d (timestamp: %d)",
+	c.Logger.LogClientWithWallTime("SEND", fmt.Sprintf("Sending request to leader node %d (timestamp: %d)",
 		c.CurrentLeaderID, request.Timestamp), c.ID)
 
 	ctx, cancel := context.WithTimeout(context.Background(), c.RetryDuration)
@@ -275,7 +303,7 @@ func (c *Client) sendRequestToLeader(request *proto.Request) error {
 	case "OK_ACCEPTED":
 		if status.LeaderId != 0 {
 			c.CurrentLeaderID = status.LeaderId
-			c.Logger.LogClient("LEADER", fmt.Sprintf("Updated current leader to node %d (from status)", c.CurrentLeaderID), c.ID)
+			c.Logger.LogClientWithWallTime("LEADER", fmt.Sprintf("Updated current leader to node %d (from status)", c.CurrentLeaderID), c.ID)
 		}
 
 		return nil
@@ -284,18 +312,28 @@ func (c *Client) sendRequestToLeader(request *proto.Request) error {
 	case "NOT_LEADER":
 		if status.LeaderId != 0 {
 			c.CurrentLeaderID = status.LeaderId
-			c.Logger.LogClient("NOT_LEADER", fmt.Sprintf("Node %d is not leader; hinted leader is %d", c.CurrentLeaderID, status.LeaderId), c.ID)
+			c.Logger.LogClientWithWallTime("NOT_LEADER", fmt.Sprintf("Node %d is not leader; hinted leader is %d", c.CurrentLeaderID, status.LeaderId), c.ID)
 		}
 		return nil
 	case "PENDING":
-		c.Logger.LogClient("PENDING", fmt.Sprintf("Leader node %d is pending; leaderId is %d", c.CurrentLeaderID, status.LeaderId), c.ID)
-		return nil
+		oldLeader := c.CurrentLeaderID
+		if status.LeaderId != 0 {
+			c.CurrentLeaderID = status.LeaderId
+			c.Logger.LogClientWithWallTime("LEADER", fmt.Sprintf("Leader node %d is pending; adopting hinted leader %d", oldLeader, status.LeaderId), c.ID)
+		} else {
+			c.Logger.LogClientWithWallTime("PENDING", fmt.Sprintf("Leader node %d is pending and provided no hint", oldLeader), c.ID)
+		}
+		return fmt.Errorf("leader node %d is pending", oldLeader)
 	default:
 		return fmt.Errorf("unexpected status from leader %d: %s - %s", c.CurrentLeaderID, status.Status, status.Message)
 	}
 }
 
 func (c *Client) startRetryTimerUnsafe() {
+
+	if c.RetryDuration <= 0 {
+		return
+	}
 
 	if c.RetryTimer != nil {
 		c.RetryTimer.Stop()
@@ -304,31 +342,50 @@ func (c *Client) startRetryTimerUnsafe() {
 	c.RetryTimer = time.AfterFunc(c.RetryDuration, func() {
 		c.handleRequestTimeout()
 	})
-	c.Logger.LogClient("TIMER", fmt.Sprintf("Retry timer started (%v timeout)", c.RetryDuration), c.ID)
+	c.Logger.LogClientWithWallTime("TIMER", fmt.Sprintf("Retry timer started (%v timeout)", c.RetryDuration), c.ID)
 }
 
 func (c *Client) stopRetryTimerUnsafe() {
 	if c.RetryTimer != nil {
 		c.RetryTimer.Stop()
 		c.RetryTimer = nil
-		c.Logger.LogClient("TIMER", "Retry timer stopped", c.ID)
+		c.Logger.LogClientWithWallTime("TIMER", "Retry timer stopped", c.ID)
 	}
 }
 
 func (c *Client) handleRequestTimeout() {
 	c.mu.Lock()
 	current := c.CurrentInFlight
-	oldLeader := c.CurrentLeaderID
-	c.CurrentLeaderID = 0
-	c.mu.Unlock()
-
 	if current == nil {
-		c.Logger.LogClient("TIMEOUT", "No current request to retry", c.ID)
+		c.mu.Unlock()
+		c.Logger.LogClientWithWallTime("TIMEOUT", "No current request to retry", c.ID)
 		return
 	}
+	oldLeader := c.CurrentLeaderID
+	c.CurrentLeaderID = 0
+	retryCount := c.currentRetryCount
+	if !c.canRetryLocked() {
+		retryErr := fmt.Errorf("Retry limit reached for request timestamp %d after %d attempts", current.request.Timestamp, retryCount)
+		c.stopRetryTimerUnsafe()
+		c.CurrentInFlight = nil
+		c.currentRetryCount = 0
+		c.mu.Unlock()
 
-	c.Logger.LogClient("TIMEOUT", fmt.Sprintf("Request timeout - leader %d failed, broadcasting to all nodes (timestamp: %d)",
-		oldLeader, current.request.Timestamp), c.ID)
+		c.Logger.LogClientWithWallTime("FAIL", retryErr.Error(), c.ID)
+		if current.onError != nil {
+			current.onError(retryErr)
+		}
+		select {
+		case c.InflightDone <- struct{}{}:
+		default:
+		}
+		return
+	}
+	c.currentRetryCount++
+	c.mu.Unlock()
+
+	c.Logger.LogClientWithWallTime("TIMEOUT", fmt.Sprintf("Request timeout #%d - leader %d failed, broadcasting to all nodes (timestamp: %d)",
+		retryCount, oldLeader, current.request.Timestamp), c.ID)
 
 	c.broadcastRequestToAllNodes(current.request)
 
@@ -337,8 +394,15 @@ func (c *Client) handleRequestTimeout() {
 	c.mu.Unlock()
 }
 
+func (c *Client) canRetryLocked() bool {
+	if c.RetryForever {
+		return true
+	}
+	return c.MaxRetryCount > 0 && c.currentRetryCount < c.MaxRetryCount
+}
+
 func (c *Client) broadcastRequestToAllNodes(request *proto.Request) {
-	c.Logger.LogClient("BROADCAST", fmt.Sprintf("Broadcasting request to all nodes (timestamp: %d)", request.Timestamp), c.ID)
+	c.Logger.LogClientWithWallTime("BROADCAST", fmt.Sprintf("Broadcasting request to all nodes (timestamp: %d)", request.Timestamp), c.ID)
 
 	var wg sync.WaitGroup
 	for _, nodeInfo := range c.Config.Nodes {
@@ -347,16 +411,16 @@ func (c *Client) broadcastRequestToAllNodes(request *proto.Request) {
 			defer wg.Done()
 			err := c.sendRequestToNode(request, nodeInfo.ID)
 			if err != nil {
-				c.Logger.LogClient("ERROR", fmt.Sprintf("Failed to send to node %d: %v", nodeInfo.ID, err), c.ID)
+				c.Logger.LogClientWithWallTime("ERROR", fmt.Sprintf("Failed to send to node %d: %v", nodeInfo.ID, err), c.ID)
 			} else {
-				c.Logger.LogClient("BROADCAST", fmt.Sprintf("Successfully sent to node %d", nodeInfo.ID), c.ID)
+				c.Logger.LogClientWithWallTime("BROADCAST", fmt.Sprintf("Successfully sent to node %d", nodeInfo.ID), c.ID)
 			}
 		}(nodeInfo)
 	}
 
 	go func() {
 		wg.Wait()
-		c.Logger.LogClient("BROADCAST", "Broadcast to all nodes completed", c.ID)
+		c.Logger.LogClientWithWallTime("BROADCAST", "Broadcast to all nodes completed", c.ID)
 	}()
 }
 
@@ -378,12 +442,12 @@ func (c *Client) sendRequestToNode(request *proto.Request, nodeID int32) error {
 			c.mu.Lock()
 			c.CurrentLeaderID = status.LeaderId
 			c.mu.Unlock()
-			c.Logger.LogClient("LEADER", fmt.Sprintf("Adopted leader %d from node %d OK_ACCEPTED", status.LeaderId, nodeID), c.ID)
+			c.Logger.LogClientWithWallTime("LEADER", fmt.Sprintf("Adopted leader %d from node %d OK_ACCEPTED", status.LeaderId, nodeID), c.ID)
 		} else {
 			c.mu.Lock()
 			c.CurrentLeaderID = nodeID
 			c.mu.Unlock()
-			c.Logger.LogClient("LEADER", fmt.Sprintf("Adopted node %d as leader (no hint)", nodeID), c.ID)
+			c.Logger.LogClientWithWallTime("LEADER", fmt.Sprintf("Adopted node %d as leader (no hint)", nodeID), c.ID)
 		}
 		return nil
 	case "INACTIVE", "NOT_LEADER":
@@ -394,14 +458,14 @@ func (c *Client) sendRequestToNode(request *proto.Request, nodeID int32) error {
 }
 
 func (c *Client) SendReply(ctx context.Context, reply *proto.Reply) (*proto.Status, error) {
-	c.Logger.Log("REPLY", fmt.Sprintf("Received reply: Result=%v, Message=%s, Timestamp=%d",
+	c.Logger.LogWithWallTime("REPLY", fmt.Sprintf("Received reply: Result=%v, Message=%s, Timestamp=%d",
 		reply.Result, reply.Message, reply.Timestamp), 0)
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	if _, exists := c.ProcessedRequests[reply.Timestamp]; exists {
-		c.Logger.Log("DUPLICATE", fmt.Sprintf("Reply for timestamp %d already processed, ignoring", reply.Timestamp), 0)
+		c.Logger.LogClientWithWallTime("DEDUP", fmt.Sprintf("Reply for timestamp %d already processed, ignoring duplicate", reply.Timestamp), c.ID)
 		return &proto.Status{Status: "success", Message: "Duplicate reply ignored"}, nil
 	}
 
@@ -409,7 +473,7 @@ func (c *Client) SendReply(ctx context.Context, reply *proto.Reply) (*proto.Stat
 		c.processCurrentReplyUnsafeUnified(reply)
 	} else {
 
-		c.Logger.Log("STALE", fmt.Sprintf("Reply for timestamp %d is not for current request", reply.Timestamp), 0)
+		c.Logger.LogClientWithWallTime("DEDUP", fmt.Sprintf("Reply for timestamp %d did not match in-flight request", reply.Timestamp), c.ID)
 	}
 
 	return &proto.Status{Status: "success", Message: "Reply processed"}, nil
@@ -420,17 +484,17 @@ func (c *Client) processCurrentReplyUnsafeUnified(reply *proto.Reply) {
 		return
 	}
 	if c.CurrentInFlight.isAsync {
-		c.Logger.Log("PROCESS", fmt.Sprintf("Processing reply for current async request (timestamp: %d)", reply.Timestamp), 0)
+		c.Logger.LogWithWallTime("PROCESS", fmt.Sprintf("Processing reply for current async request (timestamp: %d)", reply.Timestamp), 0)
 	} else {
-		c.Logger.Log("PROCESS", fmt.Sprintf("Processing reply for current request (timestamp: %d)", reply.Timestamp), 0)
+		c.Logger.LogWithWallTime("PROCESS", fmt.Sprintf("Processing reply for current request (timestamp: %d)", reply.Timestamp), 0)
 	}
 
 	if reply.Ballot != nil {
 		c.CurrentLeaderID = reply.Ballot.NodeId
 		if c.CurrentInFlight.isAsync {
-			c.Logger.Log("LEADER", fmt.Sprintf("Updated current leader to node %d (async)", c.CurrentLeaderID), 0)
+			c.Logger.LogWithWallTime("LEADER", fmt.Sprintf("Updated current leader to node %d (async)", c.CurrentLeaderID), 0)
 		} else {
-			c.Logger.Log("LEADER", fmt.Sprintf("Updated current leader to node %d", c.CurrentLeaderID), 0)
+			c.Logger.LogWithWallTime("LEADER", fmt.Sprintf("Updated current leader to node %d", c.CurrentLeaderID), 0)
 		}
 	}
 
@@ -438,12 +502,15 @@ func (c *Client) processCurrentReplyUnsafeUnified(reply *proto.Reply) {
 
 	c.ProcessedRequests[reply.Timestamp] = reply
 
+	// Reset retry count on successful reply
+	c.currentRetryCount = 0
+
 	c.CurrentInFlight = nil
 
 	if c.CurrentInFlight != nil && c.CurrentInFlight.isAsync {
-		c.Logger.Log("COMPLETE", fmt.Sprintf("Async request completed: %s (Result: %v)", reply.Message, reply.Result), 0)
+		c.Logger.LogWithWallTime("COMPLETE", fmt.Sprintf("Async request completed: %s (Result: %v)", reply.Message, reply.Result), 0)
 	} else {
-		c.Logger.Log("COMPLETE", fmt.Sprintf("Request completed: %s (Result: %v)", reply.Message, reply.Result), 0)
+		c.Logger.LogWithWallTime("COMPLETE", fmt.Sprintf("Request completed: %s (Result: %v)", reply.Message, reply.Result), 0)
 	}
 
 	select {
@@ -453,10 +520,12 @@ func (c *Client) processCurrentReplyUnsafeUnified(reply *proto.Reply) {
 }
 
 func (c *Client) getConnection(nodeID int32) (*grpc.ClientConn, error) {
-
+	c.mu.Lock()
 	if conn, exists := c.Connections[nodeID]; exists {
+		c.mu.Unlock()
 		return conn, nil
 	}
+	c.mu.Unlock()
 
 	var nodeInfo *common.NodeInfo
 	for _, info := range c.Config.Nodes {
@@ -476,6 +545,14 @@ func (c *Client) getConnection(nodeID int32) (*grpc.ClientConn, error) {
 		return nil, err
 	}
 
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if existingConn, exists := c.Connections[nodeID]; exists {
+		conn.Close()
+		return existingConn, nil
+	}
+
 	c.Connections[nodeID] = conn
 	return conn, nil
 }
@@ -488,8 +565,31 @@ func (c *Client) GetStatus() string {
 		c.ID, len(c.RequestQueue), len(c.ProcessedRequests), c.CurrentLeaderID, c.IsProcessing)
 }
 
+func (c *Client) GetPendingTransactions() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	pending := make([]string, 0, len(c.RequestQueue)+1)
+
+	// Current in-flight
+	if c.CurrentInFlight != nil {
+		txn := c.CurrentInFlight.request.Transaction
+		pending = append(pending, fmt.Sprintf("IN-FLIGHT: %s->%s $%d (timestamp: %d)",
+			txn.Sender, txn.Receiver, txn.Amount, c.CurrentInFlight.request.Timestamp))
+	}
+
+	// Queued requests
+	for i, q := range c.RequestQueue {
+		txn := q.request.Transaction
+		pending = append(pending, fmt.Sprintf("QUEUED[%d]: %s->%s $%d (timestamp: %d)",
+			i, txn.Sender, txn.Receiver, txn.Amount, q.request.Timestamp))
+	}
+
+	return pending
+}
+
 func (c *Client) PrintLog() {
-	c.Logger.LogClient("INFO", "Printing client log", c.ID)
+	c.Logger.LogClientWithWallTime("INFO", "Printing client log", c.ID)
 	fmt.Printf("=== Client %s Log ===\n", c.ID)
 	c.Logger.PrintLog()
 }

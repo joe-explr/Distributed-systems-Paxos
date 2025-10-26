@@ -37,86 +37,85 @@ func (n *Node) handleRequest(request *proto.Request) {
 		request.ClientId, request.Transaction.Sender, request.Transaction.Receiver, request.Transaction.Amount), n.ID)
 
 	rid := makeRequestID(request)
+
 	if rid != "" {
 		n.mu.Lock()
-
+		// De duplication checks only
 		lastTs := n.LastClientTimestamp[request.ClientId]
-		n.Logger.Log("REQUEST", fmt.Sprintf("Checking for duplicate request from client %s: %s->%s $%d",
-			request.ClientId, request.Transaction.Sender, request.Transaction.Receiver, request.Transaction.Amount), n.ID)
-
-		if request.Timestamp < lastTs {
-			n.Logger.Log("REQUEST", fmt.Sprintf("Request is a duplicate - client timestamp regressed: %s->%s $%d (timestamp %d < last seen %d)",
-				request.Transaction.Sender, request.Transaction.Receiver, request.Transaction.Amount, request.Timestamp, lastTs), n.ID)
-			n.mu.Unlock()
-
-			return
-		}
+		n.Logger.Log("DEDUP", fmt.Sprintf("Client %s incoming ts=%d last ts=%d (seq map entries=%d)",
+			request.ClientId, request.Timestamp, lastTs, len(n.RequestIDToSeq)), n.ID)
 
 		if seq, ok := n.RequestIDToSeq[rid]; ok {
-			n.Logger.Log("REQUEST", fmt.Sprintf("Request already accepted with sequence %d: %s->%s $%d",
-				seq, request.Transaction.Sender, request.Transaction.Receiver, request.Transaction.Amount), n.ID)
+			n.Logger.Log("DEDUP", fmt.Sprintf("Request %s already accepted with sequence %d", rid, seq), n.ID)
 
 			cached := n.LastClientReply[request.ClientId]
 			if cached != nil && cached.Timestamp == request.Timestamp {
 				original := request
 				n.mu.Unlock()
 
+				n.Logger.Log("DEDUP", fmt.Sprintf("Sending cached reply for client %s timestamp %d", request.ClientId, request.Timestamp), n.ID)
 				go n.sendReplyToClient(original, cached.Result, cached.Message, original.Transaction, 0, 0)
 				return
 			}
-			status := n.TransactionStatus[seq]
 			n.mu.Unlock()
-			if status != nil {
-				if status.Status == common.Executed || status.Status == common.Committed {
-
-					go n.checkAndRetryWaitingTransactions()
-					return
-				}
-			}
-
+			n.Logger.Log("DEDUP", fmt.Sprintf("Request is duplicate , not yet found in cache for client %s timestamp %d", request.ClientId, request.Timestamp), n.ID)
 			return
 		}
 
 		n.Logger.Log("REQUEST", fmt.Sprintf("Request not yet accepted, allowing processing: %s->%s $%d (timestamp: %d, last seen: %d)",
 			request.Transaction.Sender, request.Transaction.Receiver, request.Transaction.Amount, request.Timestamp, lastTs), n.ID)
-		n.mu.Unlock()
-	}
-	n.Logger.Log("REQUEST", fmt.Sprintf("Request is not a duplicate - continuing with processing: %s->%s $%d",
-		request.Transaction.Sender, request.Transaction.Receiver, request.Transaction.Amount), n.ID)
-	if !n.IsLeader && n.LeaderID == 0 {
-		n.Logger.Log("REQUEST", fmt.Sprintf("Not a leader, initiating leader election: %s->%s $%d",
-			request.Transaction.Sender, request.Transaction.Receiver, request.Transaction.Amount), n.ID)
-		n.mu.RLock()
-		recovering := n.RecoveryState == RecoveryInProgress
-		n.mu.RUnlock()
-		if recovering {
-			n.Logger.Log("ELECTION", "Skipping election on request - recovery in progress", n.ID)
+		// Recovery Gate
+		if n.RecoveryState == RecoveryInProgress {
+			leaderID := n.LeaderID
+			isLeader := n.IsLeader
+			if leaderID > 0 && !isLeader {
+				n.mu.Unlock()
+				n.Logger.Log("RECOVERY", fmt.Sprintf("Forwarding request %s during recovery to leader %d", rid, leaderID), n.ID)
+				n.forwardToLeader(request)
+				return
+			}
 
-			n.mu.Lock()
-			n.PendingRequests = append(n.PendingRequests, request)
+			n.enqueuePendingRequestLocked(request)
 			n.mu.Unlock()
+			n.Logger.Log("RECOVERY", fmt.Sprintf("Queuing request %s while recovery is in progress", rid), n.ID)
 			return
 		}
-		n.Logger.Log("ELECTION", "Not a leader, initiating leader election", n.ID)
 
-		n.mu.Lock()
-		n.PendingRequests = append(n.PendingRequests, request)
-		n.mu.Unlock()
+		n.Logger.Log("REQUEST", fmt.Sprintf("Request is not a duplicate - continuing with processing: %s->%s $%d",
+			request.Transaction.Sender, request.Transaction.Receiver, request.Transaction.Amount), n.ID)
 
-		go n.initiateLeaderElection()
-		return
+		// To check if the node is no longer a leader when processing the queue
+		// Enqueue the request to pending and restart election timer if no timer is running.
+		if !n.IsLeader && n.LeaderID == 0 {
+			n.Logger.Log("ELECTION", fmt.Sprintf("No leader identified; queuing request %s (client %s) and triggering election",
+				rid, request.ClientId), n.ID)
+
+			n.Logger.Log("ELECTION", "Not a leader, initiating leader election timer", n.ID)
+
+			n.enqueuePendingRequestLocked(request)
+			n.mu.Unlock()
+			n.restartTimerIfNeeded()
+			return
+		}
+
+		if !n.IsLeader {
+			n.forwardToLeader(request)
+			return
+		}
+		n.Logger.Log("REQUEST", fmt.Sprintf("Processing request as leader: %s->%s $%d",
+			request.Transaction.Sender, request.Transaction.Receiver, request.Transaction.Amount), n.ID)
+
+		n.processAsLeaderLocked(request)
 	}
-
-	if !n.IsLeader {
-		n.forwardToLeader(request)
-		return
-	}
-	n.Logger.Log("REQUEST", fmt.Sprintf("Processing request as leader: %s->%s $%d",
-		request.Transaction.Sender, request.Transaction.Receiver, request.Transaction.Amount), n.ID)
-	n.processAsLeader(request)
+	n.Logger.Log("REQUEST", "Invalid nil Request received", n.ID)
+	n.mu.Unlock()
 }
 
 func (n *Node) forwardToLeader(request *proto.Request) {
+	rid := makeRequestID(request)
+	if rid == "" {
+		return
+	}
 
 	if n.LeaderID == n.ID {
 		n.Logger.Log("ERROR", "Cannot forward to self", n.ID)
@@ -131,14 +130,12 @@ func (n *Node) forwardToLeader(request *proto.Request) {
 		go func() {
 			n.mu.Lock()
 			n.LeaderID = 0
+			n.enqueuePendingRequestLocked(request)
 			n.mu.Unlock()
 			n.Logger.Log("LEADER", fmt.Sprintf("Cleared LeaderID due to connection failure to node %d", oldLeaderID), n.ID)
 
-			n.mu.Lock()
-			n.PendingRequests = append(n.PendingRequests, request)
-			n.mu.Unlock()
 			n.Logger.Log("ELECTION", "Initiating leader election due to connection failure", n.ID)
-			n.initiateLeaderElection()
+			n.restartTimerIfNeeded()
 		}()
 		return
 	}
@@ -151,15 +148,44 @@ func (n *Node) forwardToLeader(request *proto.Request) {
 		go func() {
 			n.mu.Lock()
 			n.LeaderID = 0
+			n.enqueuePendingRequestLocked(request)
 			n.mu.Unlock()
 			n.Logger.Log("LEADER", fmt.Sprintf("Cleared LeaderID due to leader failure: %v", err), n.ID)
 
-			n.mu.Lock()
-			n.PendingRequests = append(n.PendingRequests, request)
-			n.mu.Unlock()
 			n.Logger.Log("ELECTION", "Initiating leader election due to leader processing failure", n.ID)
-			n.initiateLeaderElection()
+			n.restartTimerIfNeeded()
 		}()
+		return
+	}
+
+	n.Logger.Log("FORWARD", fmt.Sprintf("Forwarded request %s (client %s) to leader %d",
+		rid, request.ClientId, n.LeaderID), n.ID)
+}
+
+func (n *Node) forwardPendingRequestsAfterNewView(leaderID int32, pendingRequests []*proto.Request) {
+	if len(pendingRequests) == 0 {
+		return
+	}
+
+	if leaderID == 0 {
+		n.Logger.Log("FORWARD", fmt.Sprintf("Leader unknown; re-queuing %d pending requests", len(pendingRequests)), n.ID)
+		n.mu.Lock()
+		n.enqueuePendingRequestsLocked(pendingRequests)
+		n.mu.Unlock()
+		return
+	}
+
+	if leaderID == n.ID {
+		n.Logger.Log("LEADER", fmt.Sprintf("Processing %d pending requests locally after NEW-VIEW", len(pendingRequests)), n.ID)
+		for _, req := range pendingRequests {
+			n.handleRequest(req)
+		}
+		return
+	}
+
+	n.Logger.Log("FORWARD", fmt.Sprintf("Forwarding %d pending requests to new leader %d", len(pendingRequests), leaderID), n.ID)
+	for _, req := range pendingRequests {
+		n.forwardToLeader(req)
 	}
 }
 
@@ -168,49 +194,25 @@ func (n *Node) processPrepareAckMessage(senderId int32, prepareAck *proto.Prepar
 		senderId, prepareAck.Queued, prepareAck.Message), n.ID)
 
 	n.mu.Lock()
-	shouldRestart := false
+	stepDown := false
 	if n.ProposedBallotNumber != nil && prepareAck.Ballot != nil {
 		if IsHigherBallot(prepareAck.Ballot, n.ProposedBallotNumber) {
 			if IsHigherBallot(prepareAck.Ballot, n.HighestBallotSeen) {
 				n.HighestBallotSeen = prepareAck.Ballot
 			}
 			n.resetElectionTrackingLocked()
-			shouldRestart = true
+			stepDown = true
 		}
 	}
 	n.mu.Unlock()
-	if shouldRestart {
-		go n.initiateLeaderElection()
+	if stepDown {
+		n.stepDownLeader("", n.HighestBallotSeen)
 	}
 }
 
-func (n *Node) processAsLeader(request *proto.Request) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
+func (n *Node) processAsLeaderLocked(request *proto.Request) {
 
 	n.Logger.Log("LEADER", "Processing request as leader", n.ID)
-
-	if n.ProposedBallotNumber == nil || !n.IsLeader {
-		n.Logger.Log("LEADER", fmt.Sprintf("Aborting processAsLeader - no longer leader (ballot nil: %v, IsLeader: %v)",
-			n.ProposedBallotNumber == nil, n.IsLeader), n.ID)
-
-		n.PendingRequests = append(n.PendingRequests, request)
-		return
-	}
-
-	rid := makeRequestID(request)
-	if rid != "" {
-		if seq, ok := n.RequestIDToSeq[rid]; ok {
-			if info, exists := n.TransactionStatus[seq]; exists {
-				if info.Status == common.Executed || info.Status == common.Committed {
-					go n.checkAndRetryWaitingTransactions()
-					return
-				}
-			}
-
-			return
-		}
-	}
 
 	accept := &proto.Accept{
 		Ballot:   n.ProposedBallotNumber,

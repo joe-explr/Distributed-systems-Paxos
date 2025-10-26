@@ -10,6 +10,18 @@ import (
 	"time"
 )
 
+const (
+	defaultClientRetryIntervalMs = 5000
+	defaultClientAsyncTimeoutMs  = 30000
+	defaultClientMaxRetries      = 0
+	defaultNodeElectionMinMs     = 700
+	defaultNodeElectionMaxMs     = 2000
+	defaultPrepareCooldownMs     = 200
+	defaultCatchUpMaxWaitMs      = 7000
+	defaultCatchUpPollMs         = 150
+	defaultCatchUpLeaderWaitMs   = 2000
+)
+
 type NodeType int
 
 const (
@@ -131,6 +143,16 @@ func NewLogger() *Logger {
 	return &Logger{
 		entries: make([]LogEntry, 0),
 	}
+}
+
+func (l *Logger) LogWithWallTime(operation, details string, nodeID int32) {
+	wall := time.Now().UnixNano()
+	l.Log(operation, fmt.Sprintf("[wall=%d] %s", wall, details), nodeID)
+}
+
+func (l *Logger) LogClientWithWallTime(operation, details string, clientID string) {
+	wall := time.Now().UnixNano()
+	l.LogClient(operation, fmt.Sprintf("[wall=%d] %s", wall, details), clientID)
 }
 
 func (l *Logger) Log(operation, details string, nodeID int32) {
@@ -307,7 +329,16 @@ func (t *Timer) Start() {
 		t.timer.Stop()
 	}
 
-	t.timer = time.AfterFunc(t.duration, t.callback)
+	var timer *time.Timer
+	timer = time.AfterFunc(t.duration, func() {
+		t.mu.Lock()
+		if t.timer == timer {
+			t.timer = nil
+		}
+		t.mu.Unlock()
+		t.callback()
+	})
+	t.timer = timer
 
 	if t.logger != nil {
 		t.logger.Log("TIMER", fmt.Sprintf("Started timer with duration %v", t.duration), t.nodeID)
@@ -371,7 +402,16 @@ func (rt *RandomizedTimer) Start() {
 	}
 
 	randomDuration := rt.generateRandomDuration()
-	rt.timer = time.AfterFunc(randomDuration, rt.callback)
+	var timer *time.Timer
+	timer = time.AfterFunc(randomDuration, func() {
+		rt.mu.Lock()
+		if rt.timer == timer {
+			rt.timer = nil
+		}
+		rt.mu.Unlock()
+		rt.callback()
+	})
+	rt.timer = timer
 
 	if rt.logger != nil {
 		rt.logger.Log("TIMER", fmt.Sprintf("Started randomized election timer with duration %v (range: %v - %v)", randomDuration, rt.minDuration, rt.maxDuration), rt.nodeID)
@@ -414,25 +454,119 @@ func GenerateRandomElectionTimer() time.Duration {
 }
 
 type Config struct {
-	Nodes   []NodeInfo
-	Clients []ClientInfo
-	F       int32
+	Nodes   []NodeInfo   `json:"nodes"`
+	Clients []ClientInfo `json:"clients"`
+	F       int32        `json:"f"`
+	Timers  TimingConfig `json:"timers"`
+}
+
+type TimingConfig struct {
+	Client ClientTimingConfig `json:"client"`
+	Node   NodeTimingConfig   `json:"node"`
+	Test   TestTimingConfig   `json:"test"`
+}
+
+type ClientTimingConfig struct {
+	RetryIntervalMs int  `json:"retryIntervalMs"`
+	AsyncTimeoutMs  int  `json:"asyncTimeoutMs"`
+	MaxRetries      int  `json:"maxRetries"`
+	RetryForever    bool `json:"retryForever"`
+}
+
+type NodeTimingConfig struct {
+	ElectionMinMs     int `json:"electionMinMs"`
+	ElectionMaxMs     int `json:"electionMaxMs"`
+	PrepareCooldownMs int `json:"prepareCooldownMs"`
+}
+
+type TestTimingConfig struct {
+	CatchUpMaxWaitMs    int `json:"catchUpMaxWaitMs"`
+	CatchUpPollMs       int `json:"catchUpPollMs"`
+	CatchUpLeaderWaitMs int `json:"catchUpLeaderWaitMs"`
+}
+
+func defaultTimingConfig() TimingConfig {
+	return TimingConfig{
+		Client: ClientTimingConfig{
+			RetryIntervalMs: defaultClientRetryIntervalMs,
+			AsyncTimeoutMs:  defaultClientAsyncTimeoutMs,
+			MaxRetries:      defaultClientMaxRetries,
+			RetryForever:    true,
+		},
+		Node: NodeTimingConfig{
+			ElectionMinMs:     defaultNodeElectionMinMs,
+			ElectionMaxMs:     defaultNodeElectionMaxMs,
+			PrepareCooldownMs: defaultPrepareCooldownMs,
+		},
+		Test: TestTimingConfig{
+			CatchUpMaxWaitMs:    defaultCatchUpMaxWaitMs,
+			CatchUpPollMs:       defaultCatchUpPollMs,
+			CatchUpLeaderWaitMs: defaultCatchUpLeaderWaitMs,
+		},
+	}
+}
+
+func (t *TimingConfig) applyDefaults() {
+	if t == nil {
+		return
+	}
+	if t.Client.RetryIntervalMs <= 0 {
+		t.Client.RetryIntervalMs = defaultClientRetryIntervalMs
+	}
+	if t.Client.AsyncTimeoutMs <= 0 {
+		t.Client.AsyncTimeoutMs = defaultClientAsyncTimeoutMs
+	}
+	if t.Client.MaxRetries < 0 {
+		t.Client.MaxRetries = defaultClientMaxRetries
+	}
+	if t.Node.ElectionMinMs <= 0 {
+		t.Node.ElectionMinMs = defaultNodeElectionMinMs
+	}
+	if t.Node.ElectionMaxMs <= 0 {
+		t.Node.ElectionMaxMs = defaultNodeElectionMaxMs
+	}
+	if t.Node.ElectionMaxMs < t.Node.ElectionMinMs {
+		t.Node.ElectionMaxMs = t.Node.ElectionMinMs
+	}
+	if t.Node.PrepareCooldownMs <= 0 {
+		t.Node.PrepareCooldownMs = defaultPrepareCooldownMs
+	}
+	if t.Test.CatchUpMaxWaitMs <= 0 {
+		t.Test.CatchUpMaxWaitMs = defaultCatchUpMaxWaitMs
+	}
+	if t.Test.CatchUpPollMs <= 0 {
+		t.Test.CatchUpPollMs = defaultCatchUpPollMs
+	}
+	if t.Test.CatchUpLeaderWaitMs <= 0 {
+		t.Test.CatchUpLeaderWaitMs = defaultCatchUpLeaderWaitMs
+	}
+}
+
+func (c *Config) ApplyDefaults() {
+	if c == nil {
+		return
+	}
+	if c.Timers.Client.RetryIntervalMs == 0 && c.Timers.Client.AsyncTimeoutMs == 0 &&
+		c.Timers.Node.ElectionMinMs == 0 && c.Timers.Node.ElectionMaxMs == 0 {
+		c.Timers = defaultTimingConfig()
+	}
+	c.Timers.applyDefaults()
 }
 
 type NodeInfo struct {
-	ID      int32
-	Address string
-	Port    int32
+	ID      int32  `json:"id"`
+	Address string `json:"address"`
+	Port    int32  `json:"port"`
 }
 
 type ClientInfo struct {
-	ID      string
-	Address string
-	Port    int32
+	ID      string `json:"id"`
+	Address string `json:"address"`
+	Port    int32  `json:"port"`
 }
 
 func DefaultConfig() *Config {
-	return &Config{
+	cfg := &Config{
 		Nodes: []NodeInfo{
 			{ID: 1, Address: "localhost", Port: 50051},
 			{ID: 2, Address: "localhost", Port: 50052},
@@ -452,6 +586,9 @@ func DefaultConfig() *Config {
 			{ID: "I", Address: "localhost", Port: 60009},
 			{ID: "J", Address: "localhost", Port: 60010},
 		},
-		F: 2,
+		F:      2,
+		Timers: defaultTimingConfig(),
 	}
+	cfg.ApplyDefaults()
+	return cfg
 }

@@ -325,6 +325,15 @@ func (n *Node) SetNodeActive(active bool) {
 	}
 
 	if active && !wasActive {
+		// Enter recovery mode immediately to avoid acting on stale leader state.
+		n.mu.Lock()
+		if n.RecoveryState != RecoveryInProgress {
+			n.RecoveryState = RecoveryInProgress
+		}
+		n.mu.Unlock()
+
+		// Ensure we are not considered leader before recovery finishes.
+		n.stepDownLeader("node reactivated, clearing stale leader state", nil)
 		go n.simpleRecovery()
 	}
 }
@@ -333,6 +342,22 @@ func (n *Node) IsNodeActive() bool {
 	n.mu.RLock()
 	defer n.mu.RUnlock()
 	return n.IsActive
+}
+
+func (n *Node) IsRecovering() bool {
+	n.mu.RLock()
+	recovering := n.RecoveryState == RecoveryInProgress
+	n.mu.RUnlock()
+
+	if recovering {
+		return true
+	}
+
+	n.recoveryMu.Lock()
+	inFlight := n.recoveryInFlight
+	n.recoveryMu.Unlock()
+
+	return inFlight
 }
 
 func (n *Node) GetRecoveryState() RecoveryState {
@@ -474,6 +499,38 @@ func (n *Node) GetTransactionInfo(sequenceNumber int32) (*common.TransactionInfo
 		}, true
 	}
 	return nil, false
+}
+
+func (n *Node) GetPendingRequests() []*proto.Request {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+
+	pending := make([]*proto.Request, len(n.PendingRequests))
+	copy(pending, n.PendingRequests)
+	return pending
+}
+
+func (n *Node) PrintPendingRequests(ctx context.Context, req *proto.Empty) (*proto.Status, error) {
+	if !n.IsNodeActive() {
+		return &proto.Status{Status: "error", Message: "Node is down"}, nil
+	}
+
+	n.mu.RLock()
+	pending := n.PendingRequests
+	n.mu.RUnlock()
+
+	fmt.Printf("\n=== Node %d Pending Requests ===\n", n.ID)
+	if len(pending) == 0 {
+		fmt.Println("No pending requests")
+	} else {
+		for i, req := range pending {
+			fmt.Printf("%d. Client %s: %s->%s $%d (timestamp: %d)\n",
+				i+1, req.ClientId, req.Transaction.Sender,
+				req.Transaction.Receiver, req.Transaction.Amount, req.Timestamp)
+		}
+	}
+
+	return &proto.Status{Status: "success", Message: "Printed pending requests"}, nil
 }
 
 func (n *Node) GetNewViewLog() []*proto.NewView {

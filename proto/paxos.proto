@@ -180,7 +180,6 @@ service NodeService {
     rpc GetLeader(Empty) returns (NodeInfo);
 
     // Bonus: checkpoint distribution
-    rpc SendCheckpoint(Checkpoint) returns (Status);
     rpc RequestCheckpoint(CheckpointRequest) returns (CheckpointSnapshot);
 }
 

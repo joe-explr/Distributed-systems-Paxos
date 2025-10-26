@@ -37,7 +37,11 @@ type Node struct {
 	LeaderID          int32
 	IsLeader          bool
 
+	InNewViewProcessing   bool
+	PendingCommitMessages []*proto.Commit
+
 	PendingRequests      []*proto.Request
+	PendingRequestIDs    map[string]bool
 	AcceptedTransactions map[int32]*proto.Request
 	ExecutedTransactions map[int32]bool
 
@@ -158,6 +162,7 @@ func NewNode(id int32, config *common.Config) *Node {
 		LeaderID:                   0,
 		IsLeader:                   false,
 		PendingRequests:            make([]*proto.Request, 0),
+		PendingRequestIDs:          make(map[string]bool),
 		AcceptedTransactions:       make(map[int32]*proto.Request),
 		ExecutedTransactions:       make(map[int32]bool),
 		PendingClientReplies:       make(map[int32]*proto.Request),
@@ -235,14 +240,29 @@ func NewNode(id int32, config *common.Config) *Node {
 		}
 	}
 
-	minTimeout := 700 * time.Millisecond
+	minTimeout := 900 * time.Millisecond
 	maxTimeout := 2000 * time.Millisecond
+	prepareCooldown := 200 * time.Millisecond
+	if config != nil {
+		minTimeout = time.Duration(config.Timers.Node.ElectionMinMs) * time.Millisecond
+		if minTimeout <= 0 {
+			minTimeout = 700 * time.Millisecond
+		}
+		maxTimeout = time.Duration(config.Timers.Node.ElectionMaxMs) * time.Millisecond
+		if maxTimeout < minTimeout {
+			maxTimeout = minTimeout
+		}
+		prepareCooldown = time.Duration(config.Timers.Node.PrepareCooldownMs) * time.Millisecond
+		if prepareCooldown <= 0 {
+			prepareCooldown = 200 * time.Millisecond
+		}
+	}
 	node.LeaderTimer = common.NewRandomizedTimerWithLogging(minTimeout, maxTimeout, node.handleLeaderTimeout, node.Logger, node.ID)
 	node.Logger.Log("INIT", fmt.Sprintf("Initialized with randomized election timer (range: %v - %v)", minTimeout, maxTimeout), node.ID)
 
 	node.PrepareCooldown = tpState{
 		lastPrepareSeen: time.Time{},
-		tp:              200 * time.Millisecond,
+		tp:              prepareCooldown,
 	}
 
 	node.ReceivedPrepares = make([]*PrepareWithTimestamp, 0)
@@ -258,13 +278,6 @@ type PrepareWithTimestamp struct {
 type tpState struct {
 	lastPrepareSeen time.Time
 	tp              time.Duration
-}
-
-func (s *tpState) canSendPrepare(now time.Time) bool {
-	if s.lastPrepareSeen.IsZero() {
-		return true
-	}
-	return now.Sub(s.lastPrepareSeen) >= s.tp
 }
 
 func (s *tpState) notePrepareSeen(now time.Time) {

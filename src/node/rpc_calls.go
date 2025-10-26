@@ -14,160 +14,121 @@ import (
 	"google.golang.org/grpc/metadata"
 )
 
+// Client-Node Request
 func (n *Node) SendRequest(ctx context.Context, req *proto.Request) (*proto.Status, error) {
+	n.Logger.LogWithWallTime("DEBUG", fmt.Sprintf("SendRequest RPC called - client:%s timestamp:%d amount:%d sender:%s receiver:%s",
+		req.ClientId, req.Timestamp, req.Transaction.Amount, req.Transaction.Sender, req.Transaction.Receiver), n.ID)
 
 	if !n.IsNodeActive() {
-		n.Logger.Log("RPC", fmt.Sprintf("Rejecting SendRequest from client %s - node is inactive", req.ClientId), n.ID)
+		n.Logger.LogWithWallTime("RPC", fmt.Sprintf("Rejecting SendRequest from client %s - node is inactive", req.ClientId), n.ID)
 		return &proto.Status{Status: "INACTIVE", Message: "Node inactive"}, nil
 	}
 
-	n.mu.Lock()
-	clientKey := req.ClientId
-	lastTimestamp, exists := n.LastClientTimestamp[clientKey]
-
-	if exists && req.Timestamp <= lastTimestamp {
-		n.Logger.Log("DUPLICATE", fmt.Sprintf("Duplicate request from client %s (timestamp %d <= %d)",
-			req.ClientId, req.Timestamp, lastTimestamp), n.ID)
-
-		if cachedReply, hasReply := n.LastClientReply[clientKey]; hasReply {
-
-			if cachedReply.Timestamp == req.Timestamp {
-
-				n.mu.Unlock()
-
-				go func(rep *proto.Reply, clientID string) {
-					conn, err := n.getClientConnection(clientID)
-					if err != nil {
-						n.Logger.Log("ERROR", fmt.Sprintf("Failed to reconnect to client %s for duplicate reply: %v", clientID, err), n.ID)
-						return
-					}
-					client := proto.NewClientServiceClient(conn)
-					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-					defer cancel()
-					if _, err := client.SendReply(ctx, rep); err != nil {
-						n.Logger.Log("ERROR", fmt.Sprintf("Failed to re-send cached reply to client %s: %v", clientID, err), n.ID)
-						return
-					}
-					n.Logger.Log("REPLY", fmt.Sprintf("Re-sent cached reply to client %s for timestamp %d", clientID, rep.Timestamp), n.ID)
-				}(cachedReply, req.ClientId)
-
-				return &proto.Status{Status: "OK_ACCEPTED", Message: "Duplicate; reply re-sent"}, nil
-			} else {
-
-				n.Logger.Log("DUPLICATE", fmt.Sprintf("Cached reply timestamp %d doesn't match request timestamp %d for client %s - last request may have failed or is still processing it",
-					cachedReply.Timestamp, req.Timestamp, req.ClientId), n.ID)
-
-			}
-		}
+	rid := makeRequestID(req)
+	if rid == "" {
+		return &proto.Status{Status: "NIL_REQUEST", Message: "Nil request received", LeaderId: n.ID}, nil
 	}
-
-	n.mu.Unlock()
-
-	n.Logger.Log("RPC", fmt.Sprintf("Received SendRequest from client %s", req.ClientId), n.ID)
+	n.Logger.LogWithWallTime("RPC", fmt.Sprintf("Received SendRequest from client %s", req.ClientId), n.ID)
 
 	n.mu.RLock()
 	isLeader := n.IsLeader
 	knownLeader := n.LeaderID
 	n.mu.RUnlock()
 
-	if !isLeader {
+	n.Logger.LogWithWallTime("DEBUG", fmt.Sprintf("SendRequest: isLeader=%v knownLeader=%d", isLeader, knownLeader), n.ID)
 
-		if knownLeader == 0 {
-
-			n.Logger.Log("ENQUEUE", fmt.Sprintf("Attempting to enqueue request from client %s to requestChan", req.ClientId), n.ID)
-
-			select {
-			case n.requestChan <- req:
-				n.Logger.Log("ENQUEUE", fmt.Sprintf("Successfully enqueued request from client %s", req.ClientId), n.ID)
-
-				status := &proto.Status{Status: "PENDING", Message: "Election in progress", LeaderId: 0}
-				return status, nil
-			default:
-
-				n.Logger.Log("ERROR", fmt.Sprintf("Request queue full, rejecting client %s", req.ClientId), n.ID)
-				status := &proto.Status{Status: "ERROR", Message: "Request queue full", LeaderId: 0}
-				return status, nil
-			}
-		}
-
-		if knownLeader != 0 {
-
-			conn, err := n.getConnection(knownLeader)
-			if err != nil {
-				n.Logger.Log("ERROR", fmt.Sprintf("Failed to connect to leader %d: %v", knownLeader, err), n.ID)
-
-				go func() {
-					n.mu.Lock()
-					n.LeaderID = 0
-					n.mu.Unlock()
-					n.Logger.Log("LEADER", fmt.Sprintf("Cleared LeaderID due to connection failure to node %d", knownLeader), n.ID)
-				}()
-
-				n.Logger.Log("ENQUEUE", fmt.Sprintf("Attempting to enqueue request from client %s to requestChan", req.ClientId), n.ID)
-				select {
-				case n.requestChan <- req:
-					n.Logger.Log("ENQUEUE", fmt.Sprintf("Successfully enqueued request from client %s", req.ClientId), n.ID)
-					status := &proto.Status{Status: "PENDING", Message: "Election in progress", LeaderId: 0}
-					return status, nil
-				default:
-					n.Logger.Log("ERROR", fmt.Sprintf("Request queue full, rejecting client %s", req.ClientId), n.ID)
-					status := &proto.Status{Status: "ERROR", Message: "Request queue full", LeaderId: 0}
-					return status, nil
-				}
-			}
-
-			client := proto.NewNodeServiceClient(conn)
-			_, err = client.HandleRequest(context.Background(), req)
-			if err != nil {
-				n.Logger.Log("ERROR", fmt.Sprintf("Failed to forward request to leader %d: %v", knownLeader, err), n.ID)
-
-				go func() {
-					n.mu.Lock()
-					n.LeaderID = 0
-					n.mu.Unlock()
-					n.Logger.Log("LEADER", fmt.Sprintf("Cleared LeaderID due to leader failure: %v", err), n.ID)
-				}()
-
-				n.Logger.Log("ENQUEUE", fmt.Sprintf("Attempting to enqueue request from client %s to requestChan", req.ClientId), n.ID)
-				select {
-				case n.requestChan <- req:
-					n.Logger.Log("ENQUEUE", fmt.Sprintf("Successfully enqueued request from client %s", req.ClientId), n.ID)
-					status := &proto.Status{Status: "PENDING", Message: "Election in progress", LeaderId: 0}
-					return status, nil
-				default:
-					n.Logger.Log("ERROR", fmt.Sprintf("Request queue full, rejecting client %s", req.ClientId), n.ID)
-					status := &proto.Status{Status: "ERROR", Message: "Request queue full", LeaderId: 0}
-					return status, nil
-				}
-			}
-
-			status := &proto.Status{Status: "OK_ACCEPTED", Message: "Forwarded to leader", LeaderId: knownLeader}
+	if isLeader {
+		select {
+		case n.requestChan <- req:
+			status := &proto.Status{Status: "OK_ACCEPTED", Message: "Accepted for processing", LeaderId: n.ID}
+			return status, nil
+		default:
+			n.Logger.LogWithWallTime("ERROR", fmt.Sprintf("Request queue full, rejecting client %s", req.ClientId), n.ID)
+			status := &proto.Status{Status: "ERROR", Message: "Request queue full", LeaderId: n.ID}
 			return status, nil
 		}
-
-		status := &proto.Status{Status: "NOT_LEADER", Message: "Not leader", LeaderId: 0}
-		return status, nil
 	}
 
-	n.requestChan <- req
-	status := &proto.Status{Status: "OK_ACCEPTED", Message: "Accepted for processing", LeaderId: n.ID}
+	if knownLeader != 0 {
+		n.Logger.LogWithWallTime("DEBUG", fmt.Sprintf("SendRequest: forwarding to known leader %d", knownLeader), n.ID)
+		return n.forwardClientRequestToLeader(req, knownLeader)
+	}
+
+	n.mu.Lock()
+	n.enqueuePendingRequestLocked(req)
+	n.mu.Unlock()
+
+	n.Logger.LogWithWallTime("DEBUG", "SendRequest: no known leader, starting election", n.ID)
+	go n.restartTimerIfNeeded()
+	status := &proto.Status{Status: "PENDING", Message: "Leader unknown; election started", LeaderId: 0}
 	return status, nil
 }
 
 func (n *Node) HandleRequest(ctx context.Context, req *proto.Request) (*proto.Status, error) {
+	n.Logger.LogWithWallTime("DEBUG", fmt.Sprintf("HandleRequest RPC called - client:%s timestamp:%d amount:%d sender:%s receiver:%s",
+		req.ClientId, req.Timestamp, req.Transaction.Amount, req.Transaction.Sender, req.Transaction.Receiver), n.ID)
 
 	if !n.IsNodeActive() {
-		n.Logger.Log("RPC", fmt.Sprintf("Rejecting HandleRequest from another node for client %s - node is inactive", req.ClientId), n.ID)
+		n.Logger.LogWithWallTime("RPC", fmt.Sprintf("Rejecting HandleRequest from another node for client %s - node is inactive", req.ClientId), n.ID)
 		return nil, fmt.Errorf("node is inactive")
 	}
 
-	n.Logger.Log("RPC", fmt.Sprintf("Received HandleRequest from another node for client %s", req.ClientId), n.ID)
+	n.Logger.LogWithWallTime("RPC", fmt.Sprintf("Received HandleRequest from another node for client %s", req.ClientId), n.ID)
+
+	n.mu.RLock()
+	isLeader := n.IsLeader
+	leaderID := n.LeaderID
+	n.mu.RUnlock()
+
+	n.Logger.LogWithWallTime("DEBUG", fmt.Sprintf("HandleRequest: isLeader=%v leaderID=%d", isLeader, leaderID), n.ID)
+
+	if !isLeader {
+		message := "Not leader"
+		if leaderID != 0 {
+			message = fmt.Sprintf("Not leader; forward to %d", leaderID)
+		}
+		return &proto.Status{
+			Status:   "NOT_LEADER",
+			Message:  message,
+			LeaderId: leaderID,
+		}, nil
+	}
+
+	rid := makeRequestID(req)
+	var cachedReply *proto.Reply
+	var seq int32
+	var duplicate bool
+
+	n.mu.Lock()
+	if rid != "" {
+		if existingSeq, ok := n.RequestIDToSeq[rid]; ok {
+			duplicate = true
+			seq = existingSeq
+			cachedReply = n.LastClientReply[req.ClientId]
+		}
+	}
+	n.mu.Unlock()
+
+	if duplicate {
+		if cachedReply != nil && cachedReply.Timestamp == req.Timestamp {
+			go n.sendReplyToClient(req, cachedReply.Result, cachedReply.Message, req.Transaction, 0, 0)
+		}
+		msg := "Duplicate request"
+		if seq > 0 {
+			msg = fmt.Sprintf("Duplicate request; already accepted as seq %d", seq)
+		}
+		return &proto.Status{
+			Status:   "OK_ACCEPTED_DUPLICATE",
+			Message:  msg,
+			LeaderId: n.ID,
+		}, nil
+	}
 
 	select {
 	case n.requestChan <- req:
 		return &proto.Status{
 			Status:   "OK_ACCEPTED",
-			Message:  "Forwarded to leader",
+			Message:  "Accepted for processing",
 			LeaderId: n.ID,
 		}, nil
 	case <-ctx.Done():
@@ -180,6 +141,80 @@ func (n *Node) HandleRequest(ctx context.Context, req *proto.Request) (*proto.St
 			LeaderId: n.ID,
 		}, nil
 	}
+}
+
+func (n *Node) forwardClientRequestToLeader(req *proto.Request, leaderID int32) (*proto.Status, error) {
+	n.Logger.LogWithWallTime("DEBUG", fmt.Sprintf("forwardClientRequestToLeader called - forwarding client:%s to leader:%d",
+		req.ClientId, leaderID), n.ID)
+
+	attempt := leaderID
+	for redirects := 0; redirects < 2; redirects++ {
+		conn, err := n.getConnection(attempt)
+		if err != nil {
+			n.Logger.LogClientWithWallTime("FORWARD_ERROR", fmt.Sprintf("Failed to connect to leader %d: %v", attempt, err), fmt.Sprintf("%d", n.ID))
+			n.mu.Lock()
+			if n.LeaderID == attempt {
+				n.LeaderID = 0
+			}
+			n.enqueuePendingRequestLocked(req)
+			n.mu.Unlock()
+			go n.restartTimerIfNeeded()
+			return &proto.Status{Status: "PENDING", Message: "Leader unreachable; election started", LeaderId: 0}, nil
+		}
+
+		client := proto.NewNodeServiceClient(conn)
+		n.Logger.Log("FORWARD_DEBUG", fmt.Sprintf("Forwarding request to leader %d for client %s", attempt, req.ClientId), n.ID)
+		resp, err := client.HandleRequest(context.Background(), req)
+		if err != nil {
+			n.Logger.Log("ERROR", fmt.Sprintf("Failed to forward request to leader %d: %v", attempt, err), n.ID)
+			n.mu.Lock()
+			if n.LeaderID == attempt {
+				n.LeaderID = 0
+			}
+			n.enqueuePendingRequestLocked(req)
+			n.mu.Unlock()
+			go n.restartTimerIfNeeded()
+			return &proto.Status{Status: "PENDING", Message: "Leader forwarding failed; election started", LeaderId: 0}, nil
+		}
+
+		if resp == nil {
+			n.Logger.Log("ERROR", fmt.Sprintf("Nil response from leader %d while forwarding request", attempt), n.ID)
+			n.mu.Lock()
+			n.enqueuePendingRequestLocked(req)
+			n.LeaderID = 0
+			n.mu.Unlock()
+			go n.restartTimerIfNeeded()
+			return &proto.Status{Status: "PENDING", Message: "Leader response missing; election started", LeaderId: 0}, nil
+		}
+
+		if resp.Status == "NOT_LEADER" || resp.Status == "INACTIVE" {
+			if resp.LeaderId > 0 && resp.LeaderId != attempt {
+				n.Logger.Log("LEADER", fmt.Sprintf("Leader %d redirected to new leader %d after NOT_LEADER", attempt, resp.LeaderId), n.ID)
+				n.mu.Lock()
+				n.LeaderID = resp.LeaderId
+				n.mu.Unlock()
+				attempt = resp.LeaderId
+				continue
+			}
+
+			n.Logger.Log("LEADER", fmt.Sprintf("Leader %d rejected request (%s), triggering election", attempt, resp.Status), n.ID)
+			n.mu.Lock()
+			n.enqueuePendingRequestLocked(req)
+			n.LeaderID = 0
+			n.mu.Unlock()
+			go n.restartTimerIfNeeded()
+			return &proto.Status{Status: "PENDING", Message: "Leader rejected request; election started", LeaderId: resp.LeaderId}, nil
+		}
+
+		return resp, nil
+	}
+
+	n.mu.Lock()
+	n.enqueuePendingRequestLocked(req)
+	n.LeaderID = 0
+	n.mu.Unlock()
+	go n.restartTimerIfNeeded()
+	return &proto.Status{Status: "PENDING", Message: "Unable to forward after redirection attempts", LeaderId: 0}, nil
 }
 
 func (n *Node) HandlePrepare(ctx context.Context, req *proto.Prepare) (*proto.PrepareAck, error) {
@@ -223,6 +258,8 @@ func (n *Node) HandlePrepare(ctx context.Context, req *proto.Prepare) (*proto.Pr
 		n.Logger.Log("PREPARE", fmt.Sprintf("Timer running - storing prepare %d.%d for later processing",
 			req.Ballot.Round, req.Ballot.NodeId), n.ID)
 		go n.processPrepareAsync(req)
+		n.Logger.Log("PREPARE", fmt.Sprintf("Node %d acknowledged prepare %d.%d from proposer %d (queued)",
+			n.ID, req.Ballot.Round, req.Ballot.NodeId, req.Ballot.NodeId), n.ID)
 
 		return &proto.PrepareAck{
 			Ballot:  req.Ballot,
@@ -234,6 +271,8 @@ func (n *Node) HandlePrepare(ctx context.Context, req *proto.Prepare) (*proto.Pr
 		n.Logger.Log("PREPARE", fmt.Sprintf("Timer not running - processing prepare %d.%d immediately",
 			req.Ballot.Round, req.Ballot.NodeId), n.ID)
 		go n.processPrepareMessageDirectly(req)
+		n.Logger.Log("PREPARE", fmt.Sprintf("Node %d acknowledged prepare %d.%d from proposer %d (immediate)",
+			n.ID, req.Ballot.Round, req.Ballot.NodeId, req.Ballot.NodeId), n.ID)
 
 		return &proto.PrepareAck{
 			Ballot:  req.Ballot,
@@ -270,6 +309,14 @@ func (n *Node) processPrepareAsync(req *proto.Prepare) {
 
 func (n *Node) HandlePromise(ctx context.Context, req *proto.Promise) (*proto.Status, error) {
 
+	if req == nil || req.Ballot == nil {
+		n.Logger.Log("ERROR", "Received HandlePromise with nil request or ballot - ignoring", n.ID)
+		return &proto.Status{
+			Status:  "error",
+			Message: "Invalid Promise message",
+		}, nil
+	}
+
 	if !n.IsNodeActive() {
 		n.Logger.Log("RPC", fmt.Sprintf("Rejecting HandlePromise from ballot %d.%d - node is inactive", req.Ballot.Round, req.Ballot.NodeId), n.ID)
 		return &proto.Status{
@@ -278,22 +325,7 @@ func (n *Node) HandlePromise(ctx context.Context, req *proto.Promise) (*proto.St
 		}, nil
 	}
 
-	var senderID int32 = 0
-	if md, ok := metadata.FromIncomingContext(ctx); ok {
-		if vals := md.Get("x-sender-id"); len(vals) > 0 {
-			if parsed, err := strconv.Atoi(vals[0]); err == nil {
-				senderID = int32(parsed)
-			}
-		}
-	}
-	if senderID == 0 && req.SenderId != 0 {
-		senderID = req.SenderId
-	} else if req.SenderId != 0 && senderID != 0 && senderID != req.SenderId {
-		n.Logger.Log("WARN", fmt.Sprintf("Sender ID mismatch: md=%d, body=%d", senderID, req.SenderId), n.ID)
-	}
-	n.Logger.Log("RPC", fmt.Sprintf("Received HandlePromise from ballot %d.%d (sender=%d)", req.Ballot.Round, req.Ballot.NodeId, senderID), n.ID)
-
-	go n.processPromiseMessage(senderID, req)
+	go n.processPromiseMessage(req.SenderId, req)
 
 	status := &proto.Status{
 		Status:  "success",
@@ -354,19 +386,23 @@ func (n *Node) HandleAccept(ctx context.Context, req *proto.Accept) (*proto.Acce
 }
 
 func (n *Node) processAcceptAsync(req *proto.Accept) {
-	n.mu.Lock()
+	var pendingForTransfer []*proto.Request
+	shouldResetTimer := false
+	forwardLeaderID := req.Ballot.NodeId
 
-	recovering := n.RecoveryState == RecoveryInProgress
-	followerExecuted := n.ExecutedSeq
-	leaderID := req.Ballot.NodeId
-	defer n.mu.Unlock()
+	n.mu.Lock()
 
 	if IsHigherBallot(req.Ballot, n.HighestBallotSeen) {
 		n.HighestBallotSeen = req.Ballot
+		stepDownReason := fmt.Sprintf("received Accept with higher ballot %d.%d", req.Ballot.Round, req.Ballot.NodeId)
+		n.mu.Unlock()
+		n.stepDownLeader(stepDownReason, req.Ballot)
+		n.mu.Lock()
 	}
 
 	if ti, exists := n.TransactionStatus[req.Sequence]; exists {
 		if ti.Status == common.Executed || ti.Status == common.Committed {
+			n.Logger.Log("ERROR", fmt.Sprintf("Received accept for already executed sequence %d", req.Sequence), n.ID)
 			ti.BallotNumber = req.Ballot
 		} else {
 			n.updateTransactionStatusLocked(req.Sequence, req.Request, common.Accepted, req.Ballot)
@@ -384,19 +420,32 @@ func (n *Node) processAcceptAsync(req *proto.Accept) {
 	}
 	n.AcceptLog = append(n.AcceptLog, acceptLogEntry)
 
-	n.LeaderID = req.Ballot.NodeId
-	n.LastLeaderMessage = time.Now()
+	if n.LeaderID != req.Ballot.NodeId {
+		n.LeaderID = req.Ballot.NodeId
+		shouldResetTimer = true
+		forwardLeaderID = req.Ballot.NodeId
+		if len(n.PendingRequests) > 0 {
+			pendingForTransfer = make([]*proto.Request, len(n.PendingRequests))
+			copy(pendingForTransfer, n.PendingRequests)
+			n.clearPendingRequestsLocked()
+			n.Logger.Log("PENDING", fmt.Sprintf("Captured %d pending requests to forward to new leader %d",
+				len(pendingForTransfer), req.Ballot.NodeId), n.ID)
+		}
+	}
 
+	n.LastLeaderMessage = time.Now()
+	n.mu.Unlock()
+	if shouldResetTimer {
+		n.resetTimerIfRunning()
+	}
+	if len(pendingForTransfer) > 0 {
+		go n.forwardPendingRequestsAfterNewView(forwardLeaderID, pendingForTransfer)
+	}
 	go n.sendAcceptedToLeader(req)
 
 	go n.startTimerOnAccept()
 
 	go n.restartTimerIfNeeded()
-
-	if recovering && leaderID > 0 {
-		go n.requestNewViewFromLeader(leaderID)
-		_ = followerExecuted
-	}
 }
 
 func (n *Node) sendAcceptedToLeader(accept *proto.Accept) {
@@ -462,11 +511,15 @@ func (n *Node) HandleCommit(ctx context.Context, req *proto.Commit) (*proto.Stat
 func (n *Node) processCommitAsync(req *proto.Commit) {
 	n.mu.Lock()
 
-	recovering := n.RecoveryState == RecoveryInProgress
-	leaderID := req.Ballot.NodeId
-
+	n.Logger.Log("DEBUG", fmt.Sprintf("Processing commit for seq %d (current executed=%d, committed=%d)", req.Sequence, n.ExecutedSeq, n.CommittedSeq), n.ID)
+	if n.InNewViewProcessing {
+		n.Logger.Log("DEBUG", fmt.Sprintf("Buffering commit %d during NEW-VIEW", req.Sequence), n.ID)
+		n.PendingCommitMessages = append(n.PendingCommitMessages, cloneCommit(req))
+		n.mu.Unlock()
+		return
+	}
 	if req.Sequence <= n.ExecutedSeq {
-		n.Logger.Log("IGNORE", fmt.Sprintf("Ignoring commit for already executed seq %d (executed=%d)", req.Sequence, n.ExecutedSeq), n.ID)
+		n.Logger.Log("IGNORE", fmt.Sprintf("Ignoring commit for already executed seq %d (executed=%d, committed=%d)", req.Sequence, n.ExecutedSeq, n.CommittedSeq), n.ID)
 		n.mu.Unlock()
 		return
 	}
@@ -483,6 +536,8 @@ func (n *Node) processCommitAsync(req *proto.Commit) {
 
 	n.AcceptedTransactions[req.Sequence] = req.Request
 
+	// DEBUG: Log before calling executeTransaction
+	n.Logger.Log("DEBUG", fmt.Sprintf("Calling executeTransaction for seq %d (executed=%d)", req.Sequence, n.ExecutedSeq), n.ID)
 	go n.executeTransaction(req.Sequence, req.Request)
 
 	if req.Sequence > n.CommittedSeq {
@@ -495,14 +550,33 @@ func (n *Node) processCommitAsync(req *proto.Commit) {
 		}
 	}
 
-	n.LeaderID = req.Ballot.NodeId
+	if !n.IsLeader {
+		nextSeq := req.Sequence + 1
+		if n.SequenceNum < nextSeq {
+			n.SequenceNum = nextSeq
+			n.Logger.Log("DEBUG", fmt.Sprintf("Advanced SequenceNum to %d after commit of seq %d (backup)", n.SequenceNum, req.Sequence), n.ID)
+		}
+	}
+
+	if n.LeaderID != req.Ballot.NodeId {
+		n.Logger.Log("PENDING", fmt.Sprintf("Resetting leader Id to new leader %d",
+			req.Ballot.NodeId), n.ID)
+		n.LeaderID = req.Ballot.NodeId
+		var pendingForTransfer []*proto.Request
+		if len(n.PendingRequests) > 0 {
+			pendingForTransfer = make([]*proto.Request, len(n.PendingRequests))
+			copy(pendingForTransfer, n.PendingRequests)
+			n.clearPendingRequestsLocked()
+			n.Logger.Log("PENDING", fmt.Sprintf("Captured %d pending requests to forward to new leader %d",
+				len(pendingForTransfer), req.Ballot.NodeId), n.ID)
+		}
+		if len(pendingForTransfer) > 0 {
+			go n.forwardPendingRequestsAfterNewView(n.LeaderID, pendingForTransfer)
+		}
+	}
 	n.LastLeaderMessage = time.Now()
 
 	go n.restartTimerIfNeeded()
-
-	if recovering && leaderID > 0 {
-		go n.requestNewViewFromLeader(leaderID)
-	}
 }
 
 func (n *Node) HandleNewView(ctx context.Context, req *proto.NewView) (*proto.Status, error) {
@@ -536,33 +610,6 @@ func (n *Node) HandleNewView(ctx context.Context, req *proto.NewView) (*proto.St
 		req.Ballot.Round, req.Ballot.NodeId), n.ID)
 
 	return status, nil
-}
-
-func (n *Node) SendCheckpoint(ctx context.Context, req *proto.Checkpoint) (*proto.Status, error) {
-
-	if !n.IsNodeActive() {
-		n.Logger.Log("RPC", fmt.Sprintf("Rejecting SendCheckpoint seq=%d - node is inactive", req.Seq), n.ID)
-		return &proto.Status{Status: "error", Message: "Node is down"}, nil
-	}
-
-	n.Logger.Log("RPC", fmt.Sprintf("Received SendCheckpoint seq=%d", req.Seq), n.ID)
-
-	if len(req.State) > 0 {
-		n.mu.Lock()
-		err := n.installCheckpointStateLocked(req.Seq, req.State, req.Digest)
-		n.mu.Unlock()
-		if err != nil {
-			n.Logger.Log("ERROR", fmt.Sprintf("Failed to install checkpoint %d: %v", req.Seq, err), n.ID)
-			return &proto.Status{Status: "error", Message: err.Error()}, nil
-		}
-		return &proto.Status{Status: "success", Message: "Checkpoint installed"}, nil
-	}
-
-	n.mu.Lock()
-	n.LastCheckpointSeq = req.Seq
-	n.LastCheckpointDigest = req.Digest
-	n.mu.Unlock()
-	return &proto.Status{Status: "success", Message: "Checkpoint metadata recorded"}, nil
 }
 
 func (n *Node) RequestCheckpoint(ctx context.Context, req *proto.CheckpointRequest) (*proto.CheckpointSnapshot, error) {
@@ -617,8 +664,11 @@ func (n *Node) processNewViewAsync(req *proto.NewView) {
 		return
 	}
 
-	n.mu.Lock()
+	var pendingForTransfer []*proto.Request
+	shouldStopTimer := false
 
+	n.mu.Lock()
+	n.InNewViewProcessing = true
 	n.NewViewLog = append(n.NewViewLog, req)
 
 	key := fmt.Sprintf("%d.%d", req.Ballot.Round, req.Ballot.NodeId)
@@ -638,26 +688,33 @@ func (n *Node) processNewViewAsync(req *proto.NewView) {
 			n.Logger.Log("STEPDOWN",
 				fmt.Sprintf("Stepping down as leader - received NEW-VIEW from node %d with ballot %d.%d",
 					req.Ballot.NodeId, req.Ballot.Round, req.Ballot.NodeId), n.ID)
-			n.IsLeader = false
-			n.NodeType = common.Backup
-			n.PromiseCount = 0
-
-			for k := range n.PromiseAcceptLog {
-				delete(n.PromiseAcceptLog, k)
+			if IsHigherBallot(req.Ballot, n.ProposedBallotNumber) {
+				stepDownReason := fmt.Sprintf("received New-View with higher ballot %d.%d", req.Ballot.Round, req.Ballot.NodeId)
+				n.mu.Unlock()
+				n.stepDownLeader(stepDownReason, req.Ballot)
+				n.mu.Lock()
 			}
 		}
 	}
 
-	n.LeaderID = req.Ballot.NodeId
+	if n.LeaderID != req.Ballot.NodeId {
+		n.LeaderID = req.Ballot.NodeId
+		shouldStopTimer = true
+	}
 	n.LastLeaderMessage = time.Now()
 
-	if req.BaseCheckpointSeq > n.LastCheckpointSeq {
-
-		if len(n.LastCheckpointState) == 0 || n.LastCheckpointSeq != req.BaseCheckpointSeq {
-			go n.ensureCheckpointInstalled(req.BaseCheckpointSeq, req.BaseCheckpointDigest, req.Ballot.NodeId)
-		}
+	if len(n.PendingRequests) > 0 {
+		pendingForTransfer = make([]*proto.Request, len(n.PendingRequests))
+		copy(pendingForTransfer, n.PendingRequests)
+		n.clearPendingRequestsLocked()
+		n.Logger.Log("PENDING", fmt.Sprintf("Captured %d pending requests to forward to new leader %d",
+			len(pendingForTransfer), req.Ballot.NodeId), n.ID)
 	}
-
+	if n.LastCheckpointSeq < req.BaseCheckpointSeq {
+		n.mu.Unlock()
+		n.ensureCheckpointInstalled(req.BaseCheckpointSeq, req.BaseCheckpointDigest, req.Ballot.NodeId, req.Ballot)
+		n.mu.Lock()
+	}
 	acceptedMsgs := make([]*proto.Accepted, 0, len(req.AcceptLog))
 	for _, acceptLogEntry := range req.AcceptLog {
 
@@ -678,17 +735,20 @@ func (n *Node) processNewViewAsync(req *proto.NewView) {
 			NodeId:   n.ID,
 		})
 	}
-	var maxSeq int32 = 0
-	for _, e := range req.AcceptLog {
-		if e.AcceptSeq > maxSeq {
-			maxSeq = e.AcceptSeq
-		}
-	}
-	n.NewViewMaxSeq = maxSeq
 
 	leaderID := n.LeaderID
 	shouldStartTimer := !n.IsLeader && n.LeaderTimer != nil
+	bufferedCommits := n.PendingCommitMessages
+	n.PendingCommitMessages = nil
+	n.InNewViewProcessing = false
 	n.mu.Unlock()
+	if shouldStopTimer {
+		n.stopLeaderTimer()
+	}
+
+	if len(pendingForTransfer) > 0 {
+		go n.forwardPendingRequestsAfterNewView(leaderID, pendingForTransfer)
+	}
 
 	for _, accepted := range acceptedMsgs {
 		a := accepted
@@ -710,16 +770,25 @@ func (n *Node) processNewViewAsync(req *proto.NewView) {
 			}
 		}(leaderID)
 	}
+	n.mu.Lock()
+	if n.RecoveryState == RecoveryInProgress {
+		n.RecoveryState = RecoveryCompleted
+		n.Logger.Log("RECOVERY", "Recovery state changed to completed", n.ID)
+	}
+	n.mu.Unlock()
+	for _, pending := range bufferedCommits {
+		go n.processCommitAsync(pending)
+	}
 	if len(acceptedMsgs) > 0 {
 		if shouldStartTimer {
 			go n.startTimerOnAccept()
 		}
-
-		go n.restartTimerIfNeeded()
 	}
 }
 
 func (n *Node) processNewViewAcceptMessage(accept *proto.Accept, alreadyExecuted bool) {
+
+	n.rememberRequestLocked(accept.Request, accept.Sequence)
 
 	if !alreadyExecuted {
 		if transactionInfo, exists := n.TransactionStatus[accept.Sequence]; exists {
@@ -758,6 +827,14 @@ func (n *Node) processNewViewAcceptMessage(accept *proto.Accept, alreadyExecuted
 
 func (n *Node) HandleAccepted(ctx context.Context, req *proto.Accepted) (*proto.Status, error) {
 
+	if req == nil || req.Ballot == nil {
+		n.Logger.Log("ERROR", "Received HandleAccepted with nil request or ballot - ignoring", n.ID)
+		return &proto.Status{
+			Status:  "error",
+			Message: "Invalid Accepted message",
+		}, nil
+	}
+
 	if !n.IsNodeActive() {
 		n.Logger.Log("RPC", fmt.Sprintf("Rejecting HandleAccepted for sequence %d from node %d with ballot %d.%d - node is inactive",
 			req.Sequence, req.NodeId, req.Ballot.Round, req.Ballot.NodeId), n.ID)
@@ -769,6 +846,20 @@ func (n *Node) HandleAccepted(ctx context.Context, req *proto.Accepted) (*proto.
 
 	n.Logger.Log("RPC", fmt.Sprintf("Received HandleAccepted for sequence %d from node %d with ballot %d.%d",
 		req.Sequence, req.NodeId, req.Ballot.Round, req.Ballot.NodeId), n.ID)
+
+	n.mu.Lock()
+	isLeader := n.IsLeader
+	leaderID := n.LeaderID
+	n.mu.Unlock()
+
+	if !isLeader {
+		n.Logger.Log("IGNORE", fmt.Sprintf("Ignoring HandleAccepted for sequence %d from node %d - not leader", req.Sequence, req.NodeId), n.ID)
+		return &proto.Status{
+			Status:   "ignored",
+			Message:  "Not leader",
+			LeaderId: leaderID,
+		}, nil
+	}
 
 	select {
 	case n.acceptedChan <- req:

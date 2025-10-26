@@ -328,7 +328,6 @@ const (
 	NodeService_HandleRequest_FullMethodName     = "/paxos.NodeService/HandleRequest"
 	NodeService_RequestNewView_FullMethodName    = "/paxos.NodeService/RequestNewView"
 	NodeService_GetLeader_FullMethodName         = "/paxos.NodeService/GetLeader"
-	NodeService_SendCheckpoint_FullMethodName    = "/paxos.NodeService/SendCheckpoint"
 	NodeService_RequestCheckpoint_FullMethodName = "/paxos.NodeService/RequestCheckpoint"
 )
 
@@ -352,7 +351,6 @@ type NodeServiceClient interface {
 	// leader discovery
 	GetLeader(ctx context.Context, in *Empty, opts ...grpc.CallOption) (*NodeInfo, error)
 	// Bonus: checkpoint distribution
-	SendCheckpoint(ctx context.Context, in *Checkpoint, opts ...grpc.CallOption) (*Status, error)
 	RequestCheckpoint(ctx context.Context, in *CheckpointRequest, opts ...grpc.CallOption) (*CheckpointSnapshot, error)
 }
 
@@ -454,16 +452,6 @@ func (c *nodeServiceClient) GetLeader(ctx context.Context, in *Empty, opts ...gr
 	return out, nil
 }
 
-func (c *nodeServiceClient) SendCheckpoint(ctx context.Context, in *Checkpoint, opts ...grpc.CallOption) (*Status, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(Status)
-	err := c.cc.Invoke(ctx, NodeService_SendCheckpoint_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
 func (c *nodeServiceClient) RequestCheckpoint(ctx context.Context, in *CheckpointRequest, opts ...grpc.CallOption) (*CheckpointSnapshot, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(CheckpointSnapshot)
@@ -494,7 +482,6 @@ type NodeServiceServer interface {
 	// leader discovery
 	GetLeader(context.Context, *Empty) (*NodeInfo, error)
 	// Bonus: checkpoint distribution
-	SendCheckpoint(context.Context, *Checkpoint) (*Status, error)
 	RequestCheckpoint(context.Context, *CheckpointRequest) (*CheckpointSnapshot, error)
 	mustEmbedUnimplementedNodeServiceServer()
 }
@@ -532,9 +519,6 @@ func (UnimplementedNodeServiceServer) RequestNewView(context.Context, *Empty) (*
 }
 func (UnimplementedNodeServiceServer) GetLeader(context.Context, *Empty) (*NodeInfo, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetLeader not implemented")
-}
-func (UnimplementedNodeServiceServer) SendCheckpoint(context.Context, *Checkpoint) (*Status, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method SendCheckpoint not implemented")
 }
 func (UnimplementedNodeServiceServer) RequestCheckpoint(context.Context, *CheckpointRequest) (*CheckpointSnapshot, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method RequestCheckpoint not implemented")
@@ -722,24 +706,6 @@ func _NodeService_GetLeader_Handler(srv interface{}, ctx context.Context, dec fu
 	return interceptor(ctx, in, info, handler)
 }
 
-func _NodeService_SendCheckpoint_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(Checkpoint)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(NodeServiceServer).SendCheckpoint(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: NodeService_SendCheckpoint_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(NodeServiceServer).SendCheckpoint(ctx, req.(*Checkpoint))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
 func _NodeService_RequestCheckpoint_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(CheckpointRequest)
 	if err := dec(in); err != nil {
@@ -800,10 +766,6 @@ var NodeService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetLeader",
 			Handler:    _NodeService_GetLeader_Handler,
-		},
-		{
-			MethodName: "SendCheckpoint",
-			Handler:    _NodeService_SendCheckpoint_Handler,
 		},
 		{
 			MethodName: "RequestCheckpoint",

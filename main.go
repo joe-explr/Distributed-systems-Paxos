@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"math/rand"
 	"os"
@@ -13,8 +14,11 @@ import (
 	"paxos-banking/src/common"
 	"paxos-banking/src/node"
 	"paxos-banking/src/testcase"
+	"runtime/debug"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -33,7 +37,29 @@ func main() {
 		log.Printf("Failed to recreate logs directory: %v", err)
 	}
 
-	config := common.DefaultConfig()
+	terminalLogPath := filepath.Join(logDir, "terminal-output.log")
+	cleanupLogging, err := setupTerminalLogging(terminalLogPath)
+	if err != nil {
+		log.Printf("Failed to setup terminal logging: %v", err)
+	} else {
+		defer cleanupLogging()
+	}
+
+	defer logPanic()
+
+	configPath := "config.json"
+	config, err := common.LoadConfig(configPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			fmt.Printf("Config file %s not found; using defaults.\n", configPath)
+			config = common.DefaultConfig()
+		} else {
+			fmt.Printf("Failed to load config file %s: %v. Using defaults.\n", configPath, err)
+			config = common.DefaultConfig()
+		}
+	} else {
+		fmt.Printf("Loaded configuration from %s\n", configPath)
+	}
 
 	nodes := make([]*node.Node, 0, len(config.Nodes))
 	for _, nodeInfo := range config.Nodes {
@@ -77,7 +103,6 @@ func main() {
 	fmt.Println("  activate <node_id> - Activate a node")
 	fmt.Println("  deactivate <node_id> - Deactivate a node")
 	fmt.Println("  loadTest <csv_file> - Load and process test cases from CSV")
-	fmt.Println("  runAllTests - Run comprehensive test suite automatically")
 	fmt.Println("  validateState - Validate current system state")
 	fmt.Println("  resetSystem - Reset system to initial state")
 	fmt.Println("  resetDB - Reset persisted database to initial state ($10 each)")
@@ -412,15 +437,8 @@ func main() {
 
 			processor := NewEnhancedTestCaseProcessor(nodes, clients, config)
 
-			var carriedForwardTransactions []testcase.Transaction
-			for i, testCase := range testCases {
-
-				if len(carriedForwardTransactions) > 0 {
-					testCase.CarriedForwardTransactions = carriedForwardTransactions
-					fmt.Printf("\n=== Carrying Forward %d Transactions to Test Case %d ===\n",
-						len(carriedForwardTransactions), testCase.SetNumber)
-				}
-
+			// Process each test case independently (no carry-forward)
+			for _, testCase := range testCases {
 				fmt.Printf("\n=== Starting Test Case %d ===\n", testCase.SetNumber)
 				testCase.PrintTestCase()
 
@@ -430,20 +448,14 @@ func main() {
 				result := processor.ProcessTestCaseWithValidation(testCase)
 				processor.PrintDetailedResults(result)
 
-				if !result.Success && strings.Contains(result.ErrorMessage, "insufficient active nodes") {
-					fmt.Printf("Test Case %d failed due to insufficient nodes. Carrying forward remaining transactions.\n", testCase.SetNumber)
-
-					carriedForwardTransactions = append(carriedForwardTransactions, testCase.Transactions...)
-
-					if i < len(testCases)-1 {
-						fmt.Printf("Carrying forward %d transactions to next test case.\n", len(carriedForwardTransactions))
-						continue
-					} else {
-						fmt.Printf("No more test cases available. %d transactions remain unprocessed.\n", len(carriedForwardTransactions))
-					}
+				// Show status regardless of success/failure
+				if !result.Success && strings.Contains(result.ErrorMessage, "insufficient nodes") {
+					fmt.Printf("\n⚠️  Test Case %d: Transactions sent but system cannot process due to insufficient nodes.\n", testCase.SetNumber)
+					fmt.Println("Transactions are queued in clients and will retry. You can query status via logs.")
+				} else if !result.Success {
+					fmt.Printf("\n❌ Test Case %d FAILED: %s\n", testCase.SetNumber, result.ErrorMessage)
 				} else {
-
-					carriedForwardTransactions = nil
+					fmt.Printf("\n✅ Test Case %d COMPLETED successfully\n", testCase.SetNumber)
 				}
 
 				shouldExit := showInteractiveMenu(nodes, clients, config, scanner)
@@ -454,41 +466,6 @@ func main() {
 			}
 
 			processor.PrintTestSummary()
-
-		case "runAllTests":
-			fmt.Println("Running comprehensive test suite...")
-
-			processor := NewEnhancedTestCaseProcessor(nodes, clients, config)
-
-			comprehensiveFile := "comprehensive_test_cases.csv"
-			if _, err := os.Stat(comprehensiveFile); err == nil {
-				fmt.Printf("Running comprehensive tests from: %s\n", comprehensiveFile)
-				parser := common.NewCSVTestParser(comprehensiveFile)
-				testCases, err := parser.ParseTestCases()
-				if err == nil {
-					processor.RunTestSuite(testCases, "Comprehensive Tests")
-				}
-			}
-
-			edgeCaseFile := "edge_case_tests.csv"
-			if _, err := os.Stat(edgeCaseFile); err == nil {
-				fmt.Printf("Running edge case tests from: %s\n", edgeCaseFile)
-				parser := common.NewCSVTestParser(edgeCaseFile)
-				testCases, err := parser.ParseTestCases()
-				if err == nil {
-					processor.RunTestSuite(testCases, "Edge Case Tests")
-				}
-			}
-
-			originalFile := "CSE535-F25-Project-1-Testcases.csv"
-			if _, err := os.Stat(originalFile); err == nil {
-				fmt.Printf("Running original tests from: %s\n", originalFile)
-				parser := common.NewCSVTestParser(originalFile)
-				testCases, err := parser.ParseTestCases()
-				if err == nil {
-					processor.RunTestSuite(testCases, "Original Tests")
-				}
-			}
 
 		case "validateState":
 			fmt.Println("Validating system state...")
@@ -536,6 +513,69 @@ func main() {
 	}
 }
 
+func setupTerminalLogging(logFilePath string) (func(), error) {
+	if err := os.MkdirAll(filepath.Dir(logFilePath), 0755); err != nil {
+		return nil, fmt.Errorf("failed to create logs directory: %w", err)
+	}
+
+	logFile, err := os.OpenFile(logFilePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open terminal log file: %w", err)
+	}
+
+	originalStdout := os.Stdout
+	originalStderr := os.Stderr
+
+	stdoutReader, stdoutWriter, err := os.Pipe()
+	if err != nil {
+		logFile.Close()
+		return nil, fmt.Errorf("failed to create stdout pipe: %w", err)
+	}
+
+	stderrReader, stderrWriter, err := os.Pipe()
+	if err != nil {
+		stdoutWriter.Close()
+		stdoutReader.Close()
+		logFile.Close()
+		return nil, fmt.Errorf("failed to create stderr pipe: %w", err)
+	}
+
+	os.Stdout = stdoutWriter
+	os.Stderr = stderrWriter
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	copyFunc := func(reader *os.File, writers ...io.Writer) {
+		defer wg.Done()
+		multiWriter := io.MultiWriter(writers...)
+		_, _ = io.Copy(multiWriter, reader)
+	}
+
+	go copyFunc(stdoutReader, originalStdout, logFile)
+	go copyFunc(stderrReader, originalStderr, logFile)
+
+	cleanup := func() {
+		stdoutWriter.Close()
+		stderrWriter.Close()
+		wg.Wait()
+		stdoutReader.Close()
+		stderrReader.Close()
+		logFile.Close()
+		os.Stdout = originalStdout
+		os.Stderr = originalStderr
+	}
+
+	return cleanup, nil
+}
+
+func logPanic() {
+	if r := recover(); r != nil {
+		log.Printf("PANIC: %v\n%s", r, debug.Stack())
+		panic(r)
+	}
+}
+
 type TestCaseProcessor struct {
 	nodes   []*node.Node
 	clients []*client.Client
@@ -571,8 +611,6 @@ func (tcp *TestCaseProcessor) ProcessTestCase(testCase testcase.TestCase) error 
 	if err != nil {
 		return fmt.Errorf("failed to wait for completion: %v", err)
 	}
-
-	tcp.stopAllTimers()
 
 	fmt.Printf("Test Case %d completed successfully!\n", testCase.SetNumber)
 	return nil
@@ -710,20 +748,7 @@ func (tcp *TestCaseProcessor) waitForCompletion() error {
 }
 
 func (tcp *TestCaseProcessor) stopAllTimers() {
-	fmt.Println("Stopping all timers...")
-
-	for _, n := range tcp.nodes {
-		if n.LeaderTimer != nil {
-			n.LeaderTimer.Stop()
-			n.Logger.Log("TIMER", "Stopped election timer - test case completion", n.ID)
-		}
-	}
-
-	for _, c := range tcp.clients {
-		if c.RetryTimer != nil {
-			c.RetryTimer.Stop()
-		}
-	}
+	stopAllTimers(tcp.nodes, tcp.clients)
 }
 
 func (tcp *TestCaseProcessor) PrintResults() {
@@ -738,16 +763,20 @@ func (tcp *TestCaseProcessor) PrintResults() {
 }
 
 type TestResult struct {
-	SetNumber          int
-	Success            bool
-	ErrorMessage       string
-	ExpectedBalances   map[string]int32
-	ActualBalances     map[string]int32
-	ConsistencyCheck   bool
-	LeaderElections    int
-	FailedTransactions []string
-	ProcessingTime     time.Duration
-	NodeStates         map[int32]bool
+	SetNumber            int
+	Success              bool
+	ErrorMessage         string
+	ExpectedBalances     map[string]int32
+	ActualBalances       map[string]int32
+	ConsistencyCheck     bool
+	LeaderElections      int
+	FailedTransactions   []string
+	ProcessingTime       time.Duration
+	NodeStates           map[int32]bool
+	NodeBalances         map[int32]map[string]int32
+	InactiveNodeBalances map[int32]map[string]int32
+	Inconsistencies      []string
+	ReferenceNode        int32
 }
 
 type EnhancedTestCaseProcessor struct {
@@ -779,10 +808,13 @@ func (etcp *EnhancedTestCaseProcessor) ProcessTestCaseWithValidation(testCase te
 	etcp.startTime = time.Now()
 
 	result := TestResult{
-		SetNumber:        testCase.SetNumber,
-		ExpectedBalances: make(map[string]int32),
-		ActualBalances:   make(map[string]int32),
-		NodeStates:       make(map[int32]bool),
+		SetNumber:            testCase.SetNumber,
+		ExpectedBalances:     make(map[string]int32),
+		ActualBalances:       make(map[string]int32),
+		NodeStates:           make(map[int32]bool),
+		NodeBalances:         make(map[int32]map[string]int32),
+		InactiveNodeBalances: make(map[int32]map[string]int32),
+		Inconsistencies:      make([]string, 0),
 	}
 
 	err := etcp.setupLiveNodes(testCase.LiveNodes)
@@ -795,16 +827,15 @@ func (etcp *EnhancedTestCaseProcessor) ProcessTestCaseWithValidation(testCase te
 	}
 
 	activeNodeCount := etcp.countActiveNodes()
-	if activeNodeCount < 3 {
-		fmt.Printf("WARNING: Only %d active nodes available (minimum required: 3). Exiting current set early.\n", activeNodeCount)
-		result.Success = false
-		result.ErrorMessage = fmt.Sprintf("insufficient active nodes: %d < 3", activeNodeCount)
-		result.ProcessingTime = time.Since(etcp.startTime)
-		etcp.testResults = append(etcp.testResults, result)
-		return result
+	hasInsufficientNodes := activeNodeCount < 3
+	if hasInsufficientNodes {
+		fmt.Printf("WARNING: Only %d active nodes available (minimum required: 3).\n", activeNodeCount)
+		fmt.Printf("Transactions will still be sent to clients but may not complete due to insufficient quorum.\n")
+		result.ErrorMessage = fmt.Sprintf("insufficient nodes for quorum: %d < 3", activeNodeCount)
 	}
 
-	currentBalances := etcp.getCurrentNodeBalances()
+	refNodeID, currentBalances := etcp.getReferenceNodeBalances()
+	result.ReferenceNode = refNodeID
 	for clientID, balance := range currentBalances {
 		result.ExpectedBalances[clientID] = balance
 	}
@@ -819,17 +850,31 @@ func (etcp *EnhancedTestCaseProcessor) ProcessTestCaseWithValidation(testCase te
 		}
 	}
 
-	err = etcp.processTransactionsOnly(testCase)
-	if err != nil {
-		result.Success = false
-		result.ErrorMessage = err.Error()
+	// If we have insufficient nodes, send transactions without waiting for completion
+	if hasInsufficientNodes {
+		err = etcp.sendTransactionsWithoutCompletion(testCase)
+		if err != nil {
+			result.Success = false
+			result.ErrorMessage = fmt.Sprintf("%s; send error: %v", result.ErrorMessage, err)
+		} else {
+			result.Success = false // Mark as incomplete, not failed
+			result.ErrorMessage = fmt.Sprintf("%s; transactions sent but incomplete", result.ErrorMessage)
+		}
 	} else {
-		result.Success = true
+		// Normal processing with completion wait
+		err = etcp.processTransactionsOnly(testCase)
+		if err != nil {
+			result.Success = false
+			result.ErrorMessage = err.Error()
+		} else {
+			result.Success = true
+		}
 	}
 
 	etcp.collectSystemState(&result)
 
 	result.ConsistencyCheck = etcp.checkConsistency(&result)
+	etcp.compareInactiveBalances(&result)
 
 	result.ProcessingTime = time.Since(etcp.startTime)
 
@@ -869,8 +914,6 @@ func (etcp *EnhancedTestCaseProcessor) processTestCaseInternal(testCase testcase
 		return fmt.Errorf("failed to wait for completion: %v", err)
 	}
 
-	etcp.stopAllTimers()
-
 	return nil
 }
 
@@ -893,8 +936,6 @@ func (etcp *EnhancedTestCaseProcessor) processTransactionsOnly(testCase testcase
 	if err != nil {
 		return fmt.Errorf("failed to wait for completion: %v", err)
 	}
-
-	etcp.stopAllTimers()
 
 	return nil
 }
@@ -978,7 +1019,7 @@ func (etcp *EnhancedTestCaseProcessor) processTransactionsWithLeaderFails(transa
 			batchSize := transactionIndex - batchStart
 			expectedFinalSequence := startSequence + int32(batchSize)
 
-			_ = expectedFinalSequence 
+			_ = expectedFinalSequence
 		}
 
 		if lfIndex < len(leaderFails) && nextLFPos == transactionIndex {
@@ -986,24 +1027,26 @@ func (etcp *EnhancedTestCaseProcessor) processTransactionsWithLeaderFails(transa
 
 			leader := etcp.getLeaderNode()
 			if leader == nil {
-				return fmt.Errorf("no leader found when trying to execute leader fail")
+				if err := etcp.waitForNewLeader(); err != nil {
+					return fmt.Errorf("no leader found when trying to execute leader fail: %v", err)
+				}
+				leader = etcp.getLeaderNode()
+				if leader == nil {
+					return fmt.Errorf("no leader found when trying to execute leader fail")
+				}
 			}
 
 			targetSequence := leader.GetExecutedSequence()
-
 			time.Sleep(200 * time.Millisecond)
-
 			targetSequence = leader.GetExecutedSequence()
 
-			err := etcp.waitForSequenceToExecute(targetSequence)
-			if err != nil {
+			if err := etcp.waitForSequenceToExecute(targetSequence); err != nil {
 				return fmt.Errorf("failed to wait for transactions to execute: %v", err)
 			}
 
 			time.Sleep(500 * time.Millisecond)
 
-			err = etcp.failLeader()
-			if err != nil {
+			if err := etcp.failLeader(); err != nil {
 				return fmt.Errorf("failed to execute leader fail: %v", err)
 			}
 
@@ -1080,6 +1123,24 @@ func (etcp *EnhancedTestCaseProcessor) waitForCompletion() error {
 
 	maxWait := 7 * time.Second
 	poll := 150 * time.Millisecond
+	leaderWait := 2 * time.Second
+
+	if etcp.config != nil {
+		maxWait = time.Duration(etcp.config.Timers.Test.CatchUpMaxWaitMs) * time.Millisecond
+		poll = time.Duration(etcp.config.Timers.Test.CatchUpPollMs) * time.Millisecond
+		leaderWait = time.Duration(etcp.config.Timers.Test.CatchUpLeaderWaitMs) * time.Millisecond
+	}
+
+	if maxWait <= 0 {
+		maxWait = 7 * time.Second
+	}
+	if poll <= 0 {
+		poll = 150 * time.Millisecond
+	}
+	if leaderWait <= 0 {
+		leaderWait = 2 * time.Second
+	}
+
 	start := time.Now()
 
 	findLeader := func() *node.Node {
@@ -1092,7 +1153,7 @@ func (etcp *EnhancedTestCaseProcessor) waitForCompletion() error {
 	}
 
 	var leader *node.Node
-	leaderWaitDeadline := time.Now().Add(2 * time.Second)
+	leaderWaitDeadline := time.Now().Add(leaderWait)
 	for time.Now().Before(leaderWaitDeadline) {
 		if leader = findLeader(); leader != nil {
 			break
@@ -1342,7 +1403,7 @@ func (etcp *EnhancedTestCaseProcessor) verifySystemConsistency() error {
 func (etcp *EnhancedTestCaseProcessor) waitForNewLeader() error {
 	fmt.Println("Waiting for new leader election...")
 
-	maxWait := 10 * time.Second
+	maxWait := 5 * time.Second
 	start := time.Now()
 
 	for time.Since(start) < maxWait {
@@ -1359,59 +1420,238 @@ func (etcp *EnhancedTestCaseProcessor) waitForNewLeader() error {
 	return fmt.Errorf("no new leader elected within timeout")
 }
 
-func (etcp *EnhancedTestCaseProcessor) stopAllTimers() {
-	fmt.Println("Stopping all timers...")
+func (etcp *EnhancedTestCaseProcessor) sendTransactionsWithoutCompletion(testCase testcase.TestCase) error {
+	fmt.Printf("Sending %d transactions to clients (no completion guarantee)...\n", len(testCase.Transactions))
 
-	for _, n := range etcp.nodes {
-		if n.LeaderTimer != nil {
-			n.LeaderTimer.Stop()
-			n.Logger.Log("TIMER", "Stopped election timer - enhanced test case completion", n.ID)
+	allTransactions := append(testCase.CarriedForwardTransactions, testCase.Transactions...)
+	adjustedLeaderFails := etcp.adjustLeaderFailureIndices(testCase.LeaderFails, len(testCase.CarriedForwardTransactions))
+
+	// Send all transactions
+	transactionIndex := 0
+	lfIndex := 0
+
+	for transactionIndex < len(allTransactions) || lfIndex < len(adjustedLeaderFails) {
+		nextLFPos := -1
+		if lfIndex < len(adjustedLeaderFails) {
+			nextLFPos = adjustedLeaderFails[lfIndex]
+		}
+
+		// Send transactions up to next leader fail
+		endPos := len(allTransactions)
+		if nextLFPos != -1 {
+			endPos = nextLFPos
+		}
+
+		for transactionIndex < endPos {
+			txn := allTransactions[transactionIndex]
+			fmt.Printf("Sending transaction %d: %s -> %s: $%d (may timeout)\n",
+				transactionIndex+1, txn.Sender, txn.Receiver, txn.Amount)
+
+			// Send but don't wait for completion
+			err := etcp.sendTransactionNoWait(txn)
+			if err != nil {
+				fmt.Printf("Warning: Failed to queue transaction %d: %v\n", transactionIndex+1, err)
+			}
+			transactionIndex++
+			time.Sleep(50 * time.Millisecond) // Brief delay between sends
+		}
+
+		// Handle leader fail if at that position
+		if lfIndex < len(adjustedLeaderFails) && nextLFPos == transactionIndex {
+			fmt.Printf("Executing Leader Fail command at position %d\n", nextLFPos)
+			// Only fail if there is a leader
+			if leader := etcp.getLeaderNode(); leader != nil {
+				etcp.failLeader()
+				time.Sleep(1 * time.Second)
+			} else {
+				fmt.Println("No leader to fail - skipping leader fail command")
+			}
+			lfIndex++
 		}
 	}
 
-	for _, c := range etcp.clients {
-		if c.RetryTimer != nil {
-			c.RetryTimer.Stop()
-		}
-	}
+	fmt.Printf("All %d transactions have been sent to clients.\n", len(allTransactions))
+	fmt.Println("Note: Transactions may be retrying in the background. Check logs for status.")
+	return nil
 }
 
-func (etcp *EnhancedTestCaseProcessor) getCurrentNodeBalances() map[string]int32 {
-	currentBalances := make(map[string]int32)
+func (etcp *EnhancedTestCaseProcessor) sendTransactionNoWait(txn testcase.Transaction) error {
+	clientID := txn.Sender
 
-	for _, n := range etcp.nodes {
-		if n.IsNodeActive() {
-			balances := n.GetAccountBalancesMap()
-			for clientID, balance := range balances {
-				currentBalances[clientID] = balance
-			}
+	var c *client.Client
+	for _, client := range etcp.clients {
+		if client.ID == clientID {
+			c = client
 			break
 		}
 	}
 
-	return currentBalances
+	if c == nil {
+		return fmt.Errorf("client %s not found", clientID)
+	}
+
+	// Use SendTransactionAsync which doesn't block indefinitely
+	err := c.SendTransactionAsync(txn.Sender, txn.Receiver, txn.Amount)
+	if err != nil {
+		return fmt.Errorf("failed to send transaction: %v", err)
+	}
+
+	return nil
 }
 
-func (etcp *EnhancedTestCaseProcessor) collectSystemState(result *TestResult) {
+func stopAllTimers(nodes []*node.Node, clients []*client.Client) {
+	fmt.Println("Stopping all timers...")
 
-	for _, n := range etcp.nodes {
-		if n.IsNodeActive() {
-			result.NodeStates[n.ID] = true
+	for _, n := range nodes {
+		if n.LeaderTimer != nil {
+			n.LeaderTimer.Stop()
+			n.Logger.Log("TIMER", "Stopped election timer - manual stop", n.ID)
+		}
+	}
 
-			balances := n.GetAccountBalancesMap()
-			if result.ActualBalances == nil {
-				result.ActualBalances = make(map[string]int32)
-			}
-			for clientID, balance := range balances {
-				result.ActualBalances[clientID] = balance
-			}
+	for _, c := range clients {
+		if c.RetryTimer != nil {
+			c.RetryTimer.Stop()
+			c.Logger.LogClient("TIMER", "Retry timer stopped (manual stop)", c.ID)
 		}
 	}
 }
 
-func (etcp *EnhancedTestCaseProcessor) checkConsistency(result *TestResult) bool {
+func (etcp *EnhancedTestCaseProcessor) getReferenceNodeBalances() (int32, map[string]int32) {
+	for _, n := range etcp.nodes {
+		if n.IsNodeActive() {
+			return n.ID, n.GetAccountBalancesMap()
+		}
+	}
 
-	return true
+	return 0, make(map[string]int32)
+}
+
+func (etcp *EnhancedTestCaseProcessor) collectSystemState(result *TestResult) {
+
+	referenceCaptured := false
+	for _, n := range etcp.nodes {
+		active := n.IsNodeActive()
+		result.NodeStates[n.ID] = active
+
+		balances := n.GetAccountBalancesMap()
+		if active {
+			result.NodeBalances[n.ID] = balances
+			if !referenceCaptured {
+				result.ReferenceNode = n.ID
+				result.ActualBalances = copyBalancesMap(balances)
+				referenceCaptured = true
+			}
+		} else {
+			result.InactiveNodeBalances[n.ID] = balances
+		}
+	}
+}
+
+func copyBalancesMap(src map[string]int32) map[string]int32 {
+	dup := make(map[string]int32, len(src))
+	for clientID, balance := range src {
+		dup[clientID] = balance
+	}
+	return dup
+}
+
+func (etcp *EnhancedTestCaseProcessor) checkConsistency(result *TestResult) bool {
+	result.Inconsistencies = result.Inconsistencies[:0]
+	if len(result.NodeBalances) == 0 {
+		result.Inconsistencies = append(result.Inconsistencies, "no active nodes available for consistency check")
+		return false
+	}
+	if len(result.NodeBalances) == 1 {
+		return true
+	}
+
+	refID := result.ReferenceNode
+	refBalances, ok := result.NodeBalances[refID]
+	if !ok || refID == 0 {
+		for nodeID, balances := range result.NodeBalances {
+			refID = nodeID
+			refBalances = balances
+			break
+		}
+		result.ReferenceNode = refID
+	}
+
+	mismatch := false
+	for nodeID, balances := range result.NodeBalances {
+		if nodeID == refID {
+			continue
+		}
+		keySet := make(map[string]struct{})
+		for acct := range refBalances {
+			keySet[acct] = struct{}{}
+		}
+		for acct := range balances {
+			keySet[acct] = struct{}{}
+		}
+		for acct := range keySet {
+			refVal, refOk := refBalances[acct]
+			nodeVal, nodeOk := balances[acct]
+			if !refOk || !nodeOk || nodeVal != refVal {
+				mismatch = true
+				refDesc := "missing"
+				if refOk {
+					refDesc = fmt.Sprintf("$%d", refVal)
+				}
+				nodeDesc := "missing"
+				if nodeOk {
+					nodeDesc = fmt.Sprintf("$%d", nodeVal)
+				}
+				result.Inconsistencies = append(result.Inconsistencies,
+					fmt.Sprintf("Node %d account %s = %s (reference node %d = %s)", nodeID, acct, nodeDesc, refID, refDesc))
+			}
+		}
+	}
+
+	return !mismatch
+}
+
+func (etcp *EnhancedTestCaseProcessor) compareInactiveBalances(result *TestResult) {
+	if len(result.NodeBalances) == 0 || len(result.InactiveNodeBalances) == 0 {
+		return
+	}
+
+	refID := result.ReferenceNode
+	refBalances, ok := result.NodeBalances[refID]
+	if !ok || refID == 0 {
+		for nodeID, balances := range result.NodeBalances {
+			refID = nodeID
+			refBalances = balances
+			break
+		}
+		result.ReferenceNode = refID
+	}
+
+	for nodeID, balances := range result.InactiveNodeBalances {
+		keySet := make(map[string]struct{})
+		for acct := range refBalances {
+			keySet[acct] = struct{}{}
+		}
+		for acct := range balances {
+			keySet[acct] = struct{}{}
+		}
+		for acct := range keySet {
+			refVal, refOk := refBalances[acct]
+			nodeVal, nodeOk := balances[acct]
+			if !refOk || !nodeOk || nodeVal != refVal {
+				refDesc := "missing"
+				if refOk {
+					refDesc = fmt.Sprintf("$%d", refVal)
+				}
+				nodeDesc := "missing"
+				if nodeOk {
+					nodeDesc = fmt.Sprintf("$%d", nodeVal)
+				}
+				result.Inconsistencies = append(result.Inconsistencies,
+					fmt.Sprintf("Inactive node %d account %s = %s (reference active node %d = %s)", nodeID, acct, nodeDesc, refID, refDesc))
+			}
+		}
+	}
 }
 
 func (etcp *EnhancedTestCaseProcessor) PrintDetailedResults(result TestResult) {
@@ -1425,11 +1665,30 @@ func (etcp *EnhancedTestCaseProcessor) PrintDetailedResults(result TestResult) {
 	fmt.Printf("Consistency Check: %t\n", result.ConsistencyCheck)
 
 	fmt.Println("\nExpected vs Actual Balances:")
-	for clientID, expected := range result.ExpectedBalances {
+	clientIDs := make([]string, 0, len(result.ExpectedBalances))
+	for clientID := range result.ExpectedBalances {
+		clientIDs = append(clientIDs, clientID)
+	}
+	sort.Strings(clientIDs)
+
+	for _, clientID := range clientIDs {
+		expected := result.ExpectedBalances[clientID]
 		actual := result.ActualBalances[clientID]
 		match := expected == actual
 		fmt.Printf("  %s: Expected $%d, Actual $%d %s\n",
 			clientID, expected, actual, map[bool]string{true: "✓", false: "✗"}[match])
+	}
+	if result.ReferenceNode != 0 {
+		fmt.Printf("Reference node for actual balances: Node %d\n", result.ReferenceNode)
+	}
+
+	if len(result.Inconsistencies) > 0 {
+		fmt.Println("\nInconsistent balances detected:")
+		for _, entry := range result.Inconsistencies {
+			fmt.Printf("  - %s\n", entry)
+		}
+	} else {
+		fmt.Println("\nAll active nodes are consistent. Use printDB to inspect node balances when needed.")
 	}
 
 	if len(result.FailedTransactions) > 0 {
@@ -1588,9 +1847,12 @@ func showInteractiveMenu(nodes []*node.Node, clients []*client.Client, config *c
 		fmt.Println("4. Show transaction status (enter sequence number)")
 		fmt.Println("5. Show new-view messages (choose specific node)")
 		fmt.Println("6. Show log files (persistent logs)")
-		fmt.Println("7. Continue to next test case")
-		fmt.Println("8. Exit load test")
-		fmt.Print("\nEnter your choice (1-8): ")
+		fmt.Println("7. Show pending client transactions (choose client)")
+		fmt.Println("8. Show pending node requests (choose node)")
+		fmt.Println("9. Stop all timers (nodes and clients)")
+		fmt.Println("10. Continue to next test case")
+		fmt.Println("11. Exit load test")
+		fmt.Print("\nEnter your choice (1-11): ")
 
 		if !scanner.Scan() {
 			return false
@@ -1613,12 +1875,18 @@ func showInteractiveMenu(nodes []*node.Node, clients []*client.Client, config *c
 		case "6":
 			showLogFiles()
 		case "7":
-			return false
+			showPendingClientTransactions(clients, scanner)
 		case "8":
+			showPendingNodeRequests(nodes, scanner)
+		case "9":
+			stopAllTimers(nodes, clients)
+		case "10":
+			return false
+		case "11":
 			fmt.Println("Exiting load test...")
 			return true
 		default:
-			fmt.Println("Invalid choice. Please enter 1-8.")
+			fmt.Println("Invalid choice. Please enter 1-11.")
 		}
 
 		fmt.Println("\nPress Enter to return to menu...")
@@ -1735,14 +2003,12 @@ func showNodeDatabase(nodes []*node.Node, scanner *bufio.Scanner) {
 		for _, n := range nodes {
 			fmt.Printf("\n--- Node %d Database ---\n", n.ID)
 			if n.IsNodeActive() {
-				fmt.Println("Account Balances:")
-				balances := n.GetAccountBalancesMap()
-				for clientID, balance := range balances {
-					fmt.Printf("  Client %s: $%d\n", clientID, balance)
-				}
+				fmt.Println("Status: ACTIVE")
 			} else {
-				fmt.Println("Node is inactive - no database available")
+				fmt.Println("Status: INACTIVE")
 			}
+			fmt.Println("Account Balances:")
+			printSortedBalances(n.GetAccountBalancesMap())
 		}
 	} else {
 		nodeID, err := strconv.Atoi(input)
@@ -1766,14 +2032,23 @@ func showNodeDatabase(nodes []*node.Node, scanner *bufio.Scanner) {
 
 		fmt.Printf("=== Node %d Database ===\n", nodeID)
 		if targetNode.IsNodeActive() {
-			fmt.Println("Account Balances:")
-			balances := targetNode.GetAccountBalancesMap()
-			for clientID, balance := range balances {
-				fmt.Printf("  Client %s: $%d\n", clientID, balance)
-			}
+			fmt.Println("Status: ACTIVE")
 		} else {
-			fmt.Println("Node is inactive - no database available")
+			fmt.Println("Status: INACTIVE")
 		}
+		fmt.Println("Account Balances:")
+		printSortedBalances(targetNode.GetAccountBalancesMap())
+	}
+}
+
+func printSortedBalances(balances map[string]int32) {
+	clientIDs := make([]string, 0, len(balances))
+	for clientID := range balances {
+		clientIDs = append(clientIDs, clientID)
+	}
+	sort.Strings(clientIDs)
+	for _, clientID := range clientIDs {
+		fmt.Printf("  Client %s: $%d\n", clientID, balances[clientID])
 	}
 }
 
@@ -1793,26 +2068,29 @@ func showTransactionStatus(nodes []*node.Node, scanner *bufio.Scanner) {
 	fmt.Printf("=== Transaction Status for Sequence %d ===\n", seqNum)
 
 	for _, n := range nodes {
+		fmt.Printf("\n--- Node %d ---\n", n.ID)
 		if n.IsNodeActive() {
-			fmt.Printf("\n--- Node %d ---\n", n.ID)
-			if transactionInfo, exists := n.GetTransactionInfo(int32(seqNum)); exists {
-				fmt.Printf("Status: %s\n", transactionInfo.Status.String())
-				if transactionInfo.Request != nil {
-					fmt.Printf("Transaction: %s->%s $%d\n",
-						transactionInfo.Request.Transaction.Sender,
-						transactionInfo.Request.Transaction.Receiver,
-						transactionInfo.Request.Transaction.Amount)
-				}
-				if transactionInfo.BallotNumber != nil {
-					fmt.Printf("Ballot: (%d, %d)\n",
-						transactionInfo.BallotNumber.Round,
-						transactionInfo.BallotNumber.NodeId)
-				}
-				fmt.Printf("Timestamp: %s\n", transactionInfo.Timestamp.Format("15:04:05.000"))
-			} else {
-				fmt.Printf("Status: X (No Status)\n")
-				fmt.Println("Transaction not found or not processed yet")
+			fmt.Println("Node Status: ACTIVE")
+		} else {
+			fmt.Println("Node Status: INACTIVE")
+		}
+		if transactionInfo, exists := n.GetTransactionInfo(int32(seqNum)); exists {
+			fmt.Printf("Transaction Status: %s\n", transactionInfo.Status.String())
+			if transactionInfo.Request != nil {
+				fmt.Printf("Transaction: %s->%s $%d\n",
+					transactionInfo.Request.Transaction.Sender,
+					transactionInfo.Request.Transaction.Receiver,
+					transactionInfo.Request.Transaction.Amount)
 			}
+			if transactionInfo.BallotNumber != nil {
+				fmt.Printf("Ballot: (%d, %d)\n",
+					transactionInfo.BallotNumber.Round,
+					transactionInfo.BallotNumber.NodeId)
+			}
+			fmt.Printf("Timestamp: %s\n", transactionInfo.Timestamp.Format("15:04:05.000"))
+		} else {
+			fmt.Printf("Transaction Status: X (No Status)\n")
+			fmt.Println("Transaction not found or not processed yet")
 		}
 	}
 }
@@ -1942,5 +2220,95 @@ func showLogFiles() {
 			}
 			fmt.Print(string(content))
 		}
+	}
+}
+
+func showPendingClientTransactions(clients []*client.Client, scanner *bufio.Scanner) {
+	fmt.Print("Enter client ID to view pending transactions (or 'all' for all clients): ")
+	if !scanner.Scan() {
+		return
+	}
+
+	input := strings.TrimSpace(scanner.Text())
+
+	if input == "all" {
+		fmt.Println("=== ALL CLIENT PENDING TRANSACTIONS ===")
+		for _, c := range clients {
+			pending := c.GetPendingTransactions()
+			fmt.Printf("\n--- Client %s ---\n", c.ID)
+			if len(pending) == 0 {
+				fmt.Println("No pending transactions")
+			} else {
+				for _, p := range pending {
+					fmt.Println(p)
+				}
+			}
+		}
+	} else {
+		var targetClient *client.Client
+		for _, c := range clients {
+			if c.ID == input {
+				targetClient = c
+				break
+			}
+		}
+
+		if targetClient == nil {
+			fmt.Printf("Client %s not found\n", input)
+			return
+		}
+
+		pending := targetClient.GetPendingTransactions()
+		fmt.Printf("=== Client %s Pending Transactions ===\n", input)
+		if len(pending) == 0 {
+			fmt.Println("No pending transactions")
+		} else {
+			for _, p := range pending {
+				fmt.Println(p)
+			}
+		}
+	}
+}
+
+func showPendingNodeRequests(nodes []*node.Node, scanner *bufio.Scanner) {
+	fmt.Print("Enter node ID to view pending requests (or 'all' for all nodes): ")
+	if !scanner.Scan() {
+		return
+	}
+
+	input := strings.TrimSpace(scanner.Text())
+
+	if input == "all" {
+		fmt.Println("=== ALL NODE PENDING REQUESTS ===")
+		for _, n := range nodes {
+			if !n.IsNodeActive() {
+				fmt.Printf("\n--- Node %d (INACTIVE) ---\n", n.ID)
+				fmt.Println("Node is inactive")
+				continue
+			}
+			fmt.Printf("\n--- Node %d ---\n", n.ID)
+			n.PrintPendingRequests(context.Background(), &proto.Empty{})
+		}
+	} else {
+		nodeID, err := strconv.Atoi(input)
+		if err != nil {
+			fmt.Printf("Invalid node ID: %s\n", input)
+			return
+		}
+
+		var targetNode *node.Node
+		for _, n := range nodes {
+			if n.ID == int32(nodeID) {
+				targetNode = n
+				break
+			}
+		}
+
+		if targetNode == nil {
+			fmt.Printf("Node %d not found\n", nodeID)
+			return
+		}
+
+		targetNode.PrintPendingRequests(context.Background(), &proto.Empty{})
 	}
 }

@@ -1444,7 +1444,7 @@ const file_proto_paxos_proto_rawDesc = "" +
 	"\bPrintLog\x12\f.paxos.Empty\x1a\r.paxos.Status\x12&\n" +
 	"\aPrintDB\x12\f.paxos.Empty\x1a\r.paxos.Status\x127\n" +
 	"\vPrintStatus\x12\x19.paxos.PrintStatusRequest\x1a\r.paxos.Status\x12(\n" +
-	"\tPrintView\x12\f.paxos.Empty\x1a\r.paxos.Status2\xbc\x04\n" +
+	"\tPrintView\x12\f.paxos.Empty\x1a\r.paxos.Status2\x88\x04\n" +
 	"\vNodeService\x122\n" +
 	"\rHandlePrepare\x12\x0e.paxos.Prepare\x1a\x11.paxos.PrepareAck\x12.\n" +
 	"\rHandlePromise\x12\x0e.paxos.Promise\x1a\r.paxos.Status\x12/\n" +
@@ -1454,8 +1454,7 @@ const file_proto_paxos_proto_rawDesc = "" +
 	"\rHandleNewView\x12\x0e.paxos.NewView\x1a\r.paxos.Status\x12.\n" +
 	"\rHandleRequest\x12\x0e.paxos.Request\x1a\r.paxos.Status\x12.\n" +
 	"\x0eRequestNewView\x12\f.paxos.Empty\x1a\x0e.paxos.NewView\x12*\n" +
-	"\tGetLeader\x12\f.paxos.Empty\x1a\x0f.paxos.NodeInfo\x122\n" +
-	"\x0eSendCheckpoint\x12\x11.paxos.Checkpoint\x1a\r.paxos.Status\x12H\n" +
+	"\tGetLeader\x12\f.paxos.Empty\x1a\x0f.paxos.NodeInfo\x12H\n" +
 	"\x11RequestCheckpoint\x12\x18.paxos.CheckpointRequest\x1a\x19.paxos.CheckpointSnapshot29\n" +
 	"\rClientService\x12(\n" +
 	"\tSendReply\x12\f.paxos.Reply\x1a\r.paxos.StatusB\tZ\a./protob\x06proto3"
@@ -1531,29 +1530,27 @@ var file_proto_paxos_proto_depIdxs = []int32{
 	2,  // 30: paxos.NodeService.HandleRequest:input_type -> paxos.Request
 	20, // 31: paxos.NodeService.RequestNewView:input_type -> paxos.Empty
 	20, // 32: paxos.NodeService.GetLeader:input_type -> paxos.Empty
-	13, // 33: paxos.NodeService.SendCheckpoint:input_type -> paxos.Checkpoint
-	14, // 34: paxos.NodeService.RequestCheckpoint:input_type -> paxos.CheckpointRequest
-	12, // 35: paxos.ClientService.SendReply:input_type -> paxos.Reply
-	19, // 36: paxos.PaxosService.SendRequest:output_type -> paxos.Status
-	19, // 37: paxos.PaxosService.GetStatus:output_type -> paxos.Status
-	19, // 38: paxos.PaxosService.PrintLog:output_type -> paxos.Status
-	19, // 39: paxos.PaxosService.PrintDB:output_type -> paxos.Status
-	19, // 40: paxos.PaxosService.PrintStatus:output_type -> paxos.Status
-	19, // 41: paxos.PaxosService.PrintView:output_type -> paxos.Status
-	5,  // 42: paxos.NodeService.HandlePrepare:output_type -> paxos.PrepareAck
-	19, // 43: paxos.NodeService.HandlePromise:output_type -> paxos.Status
-	8,  // 44: paxos.NodeService.HandleAccept:output_type -> paxos.AcceptAck
-	19, // 45: paxos.NodeService.HandleAccepted:output_type -> paxos.Status
-	19, // 46: paxos.NodeService.HandleCommit:output_type -> paxos.Status
-	19, // 47: paxos.NodeService.HandleNewView:output_type -> paxos.Status
-	19, // 48: paxos.NodeService.HandleRequest:output_type -> paxos.Status
-	11, // 49: paxos.NodeService.RequestNewView:output_type -> paxos.NewView
-	16, // 50: paxos.NodeService.GetLeader:output_type -> paxos.NodeInfo
-	19, // 51: paxos.NodeService.SendCheckpoint:output_type -> paxos.Status
-	15, // 52: paxos.NodeService.RequestCheckpoint:output_type -> paxos.CheckpointSnapshot
-	19, // 53: paxos.ClientService.SendReply:output_type -> paxos.Status
-	36, // [36:54] is the sub-list for method output_type
-	18, // [18:36] is the sub-list for method input_type
+	14, // 33: paxos.NodeService.RequestCheckpoint:input_type -> paxos.CheckpointRequest
+	12, // 34: paxos.ClientService.SendReply:input_type -> paxos.Reply
+	19, // 35: paxos.PaxosService.SendRequest:output_type -> paxos.Status
+	19, // 36: paxos.PaxosService.GetStatus:output_type -> paxos.Status
+	19, // 37: paxos.PaxosService.PrintLog:output_type -> paxos.Status
+	19, // 38: paxos.PaxosService.PrintDB:output_type -> paxos.Status
+	19, // 39: paxos.PaxosService.PrintStatus:output_type -> paxos.Status
+	19, // 40: paxos.PaxosService.PrintView:output_type -> paxos.Status
+	5,  // 41: paxos.NodeService.HandlePrepare:output_type -> paxos.PrepareAck
+	19, // 42: paxos.NodeService.HandlePromise:output_type -> paxos.Status
+	8,  // 43: paxos.NodeService.HandleAccept:output_type -> paxos.AcceptAck
+	19, // 44: paxos.NodeService.HandleAccepted:output_type -> paxos.Status
+	19, // 45: paxos.NodeService.HandleCommit:output_type -> paxos.Status
+	19, // 46: paxos.NodeService.HandleNewView:output_type -> paxos.Status
+	19, // 47: paxos.NodeService.HandleRequest:output_type -> paxos.Status
+	11, // 48: paxos.NodeService.RequestNewView:output_type -> paxos.NewView
+	16, // 49: paxos.NodeService.GetLeader:output_type -> paxos.NodeInfo
+	15, // 50: paxos.NodeService.RequestCheckpoint:output_type -> paxos.CheckpointSnapshot
+	19, // 51: paxos.ClientService.SendReply:output_type -> paxos.Status
+	35, // [35:52] is the sub-list for method output_type
+	18, // [18:35] is the sub-list for method input_type
 	18, // [18:18] is the sub-list for extension type_name
 	18, // [18:18] is the sub-list for extension extendee
 	0,  // [0:18] is the sub-list for field type_name

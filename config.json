@@ -1,0 +1,20 @@
+{
+  "timers": {
+    "client": {
+      "retryIntervalMs": 2500,
+      "asyncTimeoutMs": 30000,
+      "maxRetries": 15,
+      "retryForever": false
+    },
+    "node": {
+      "electionMinMs": 900,
+      "electionMaxMs": 1200,
+      "prepareCooldownMs": 200
+    },
+    "test": {
+      "catchUpMaxWaitMs": 35000,
+      "catchUpPollMs": 100,
+      "catchUpLeaderWaitMs": 9000
+    }
+  }
+}
