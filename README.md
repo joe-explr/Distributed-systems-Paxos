@@ -6,7 +6,7 @@ This project implements a **stable-leader Paxos** variant to efficiently replica
 
 ---
 
-## 🚀 Features
+## Features
 
 - Multi-Paxos with **stable leader optimization**
 - Automatic **leader election and recovery**
@@ -19,7 +19,7 @@ This project implements a **stable-leader Paxos** variant to efficiently replica
 
 ---
 
-## 🏗️ System Architecture
+## System Architecture
 
 - **Nodes:** 5 replicas (2f + 1, f = 2)
 - **Clients:** 10 logical clients
@@ -36,7 +36,7 @@ Each node maintains:
 
 ---
 
-## 🔁 Protocol Overview
+## Protocol Overview
 
 ### Normal Operation
 1. Client sends `(sender, receiver, amount)` to leader
@@ -54,7 +54,7 @@ Each node maintains:
 
 ---
 
-## 🧪 Supported Commands
+## Supported Commands
 
 - `PrintDB()` — Print balances on all nodes
 - `PrintLog(node)` — Inspect Paxos logs
@@ -63,7 +63,7 @@ Each node maintains:
 
 ---
 
-## ▶️ Running the System
+## Running the System
 
 ```bash
 # Build
