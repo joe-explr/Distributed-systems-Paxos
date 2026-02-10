@@ -1,56 +1,78 @@
-Name: Joseph B Antony
-SBU ID: 116006668
+# Multi-Paxos Distributed Banking System
 
+A fault-tolerant distributed banking system built on **Multi-Paxos**, supporting continuous transaction processing with leader election, crash fault tolerance, and exactly-once semantics.
 
-Notes:
-1. Used LLMs aid for understanding Go code practices, synchronization and deadlock debugging.
-2. Timer 2 strategy is used. 
-3. Checkpointing is Done (extra Credits).
-4. The application is run from main.go file 
-5. the terminal interaction implementation and CSV parser was mostly created using LLM generated code.
-6. SQLite3 used for persistent storage.
-7. My interactive Grader Marks successful test cases as failure too, cuz the db doesnt match with the inactive nodes.
+This project implements a **stable-leader Paxos** variant to efficiently replicate a sequence of transactions across replicas while tolerating node failures.
 
-What might be breaking currently:
+---
 
+## 🚀 Features
 
-Run cmd: `go build -o main main.go`
-`./main`
-to execute the application.
+- Multi-Paxos with **stable leader optimization**
+- Automatic **leader election and recovery**
+- Exactly-once client semantics using timestamps
+- Crash fault tolerance (fail-stop model)
+- Deterministic total order execution
+- Distributed key-value datastore (bank balances)
+- Client retry and leader redirection logic
+- Debugging & observability via introspection commands
 
-=== System Ready ===
-Available commands:
+---
 
-  transaction <client_id> <sender> <receiver> <amount> - Send transaction
+## 🏗️ System Architecture
 
-  status <node_id> - Get node status
+- **Nodes:** 5 replicas (2f + 1, f = 2)
+- **Clients:** 10 logical clients
+- **Replication:** State machine replication
+- **Fault Model:** Crash failures
+- **Communication:** RPC / TCP-based message passing
+- **Execution Model:** Out-of-order proposal, in-order execution
 
-  log <node_id> - Print node log
+Each node maintains:
+- Accepted log
+- Commit log
+- Execution pointer
+- Client reply cache (for exactly-once semantics)
 
-  db <node_id> - Print node database (PrintDB)
+---
 
-  printStatus <node_id> <sequence> - Print transaction status
+## 🔁 Protocol Overview
 
-  printView <node_id> - Print new-view messages
+### Normal Operation
+1. Client sends `(sender, receiver, amount)` to leader
+2. Leader assigns a monotonically increasing **sequence number**
+3. Leader broadcasts `ACCEPT(b, s, txn)`
+4. Replicas respond with `ACCEPTED`
+5. Leader commits after majority and broadcasts `COMMIT`
+6. All nodes execute transaction in order
 
-  failLeader - Fail the current leader
+### Leader Election
+- Triggered by timeout
+- Uses `PREPARE / PROMISE`
+- Accept logs are merged to avoid lost updates
+- Missing sequence numbers are filled with **no-op**
 
-  activate <node_id> - Activate a node
+---
 
-  deactivate <node_id> - Deactivate a node
+## 🧪 Supported Commands
 
-  loadTest <csv_file> - Load and process test cases from CSV
+- `PrintDB()` — Print balances on all nodes
+- `PrintLog(node)` — Inspect Paxos logs
+- `PrintStatus(seq)` — View status (Accepted / Committed / Executed)
+- `PrintView()` — Show leader changes
 
-  runAllTests - Run comprehensive test suite automatically
+---
 
-  validateState - Validate current system state
+## ▶️ Running the System
 
-  resetSystem - Reset system to initial state
+```bash
+# Build
+make
 
-  resetDB - Reset persisted database to initial state ($10 each)
+# Run nodes
+./node --id 1
+./node --id 2
+...
 
-  quit - Exit the program
-
-
-
-
+# Run client
+./client input.csv
